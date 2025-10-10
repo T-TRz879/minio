@@ -331,7 +331,7 @@ func checkPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Requ
 func ifModifiedSince(objTime time.Time, givenTime time.Time) bool {
 	// The Date-Modified header truncates sub-second precision, so
 	// use mtime < t+1s instead of mtime <= t to check for unmodified.
-	return objTime.After(givenTime.Add(1 * time.Second))
+	return !objTime.Before(givenTime.Add(1 * time.Second))
 }
 
 // canonicalizeETag returns ETag with leading and trailing double-quotes removed,
@@ -352,11 +352,11 @@ func isETagEqual(left, right string) bool {
 // setPutObjHeaders sets all the necessary headers returned back
 // upon a success Put/Copy/CompleteMultipart/Delete requests
 // to activate delete only headers set delete as true
-func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool, h http.Header) {
+func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, del bool, h http.Header) {
 	// We must not use the http.Header().Set method here because some (broken)
 	// clients expect the ETag header key to be literally "ETag" - not "Etag" (case-sensitive).
 	// Therefore, we have to set the ETag directly as map entry.
-	if objInfo.ETag != "" && !delete {
+	if objInfo.ETag != "" && !del {
 		w.Header()[xhttp.ETag] = []string{`"` + objInfo.ETag + `"`}
 	}
 
@@ -364,20 +364,21 @@ func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool, h 
 	if objInfo.VersionID != "" && objInfo.VersionID != nullVersionID {
 		w.Header()[xhttp.AmzVersionID] = []string{objInfo.VersionID}
 		// If version is a deleted marker, set this header as well
-		if objInfo.DeleteMarker && delete { // only returned during delete object
+		if objInfo.DeleteMarker && del { // only returned during delete object
 			w.Header()[xhttp.AmzDeleteMarker] = []string{strconv.FormatBool(objInfo.DeleteMarker)}
 		}
 	}
 
 	if objInfo.Bucket != "" && objInfo.Name != "" {
-		if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil && !delete {
+		if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil && !del {
 			lc.SetPredictionHeaders(w, objInfo.ToLifecycleOpts())
 		}
 	}
-	hash.AddChecksumHeader(w, objInfo.decryptChecksums(0, h))
+	cs, _ := objInfo.decryptChecksums(0, h)
+	hash.AddChecksumHeader(w, cs)
 }
 
-func deleteObjectVersions(ctx context.Context, o ObjectLayer, bucket string, toDel []ObjectToDelete, lcEvent lifecycle.Event) {
+func deleteObjectVersions(ctx context.Context, o ObjectLayer, bucket string, toDel []ObjectToDelete, lcEvent []lifecycle.Event) {
 	for remaining := toDel; len(remaining) > 0; toDel = remaining {
 		if len(toDel) > maxDeleteList {
 			remaining = toDel[maxDeleteList:]
@@ -398,8 +399,7 @@ func deleteObjectVersions(ctx context.Context, o ObjectLayer, bucket string, toD
 				VersionID: dobj.VersionID,
 			}
 			traceFn := globalLifecycleSys.trace(oi)
-			// Note: NewerNoncurrentVersions action is performed only scanner today
-			tags := newLifecycleAuditEvent(lcEventSrc_Scanner, lcEvent).Tags()
+			tags := newLifecycleAuditEvent(lcEventSrc_Scanner, lcEvent[i]).Tags()
 
 			// Send audit for the lifecycle delete operation
 			auditLogLifecycle(

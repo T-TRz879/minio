@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -49,12 +50,11 @@ import (
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
+	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/once"
 	"github.com/tinylib/msgp/msgp"
 	"github.com/zeebo/xxh3"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 )
 
 const (
@@ -147,7 +147,7 @@ func validateReplicationDestination(ctx context.Context, bucket string, rCfg *re
 				if errInt == nil {
 					err = nil
 				} else {
-					err = errInt.(error)
+					err, _ = errInt.(error)
 				}
 			}
 			switch err.(type) {
@@ -253,31 +253,31 @@ func getMustReplicateOptions(userDefined map[string]string, userTags string, sta
 func mustReplicate(ctx context.Context, bucket, object string, mopts mustReplicateOptions) (dsc ReplicateDecision) {
 	// object layer not initialized we return with no decision.
 	if newObjectLayerFn() == nil {
-		return
+		return dsc
 	}
 
 	// Disable server-side replication on object prefixes which are excluded
 	// from versioning via the MinIO bucket versioning extension.
 	if !globalBucketVersioningSys.PrefixEnabled(bucket, object) {
-		return
+		return dsc
 	}
 
 	replStatus := mopts.ReplicationStatus()
 	if replStatus == replication.Replica && !mopts.isMetadataReplication() {
-		return
+		return dsc
 	}
 
 	if mopts.replicationRequest { // incoming replication request on target cluster
-		return
+		return dsc
 	}
 
 	cfg, err := getReplicationConfig(ctx, bucket)
 	if err != nil {
 		replLogOnceIf(ctx, err, bucket)
-		return
+		return dsc
 	}
 	if cfg == nil {
-		return
+		return dsc
 	}
 
 	opts := replication.ObjectOpts{
@@ -348,16 +348,16 @@ func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelet
 	rcfg, err := getReplicationConfig(ctx, bucket)
 	if err != nil || rcfg == nil {
 		replLogOnceIf(ctx, err, bucket)
-		return
+		return dsc
 	}
 	// If incoming request is a replication request, it does not need to be re-replicated.
 	if delOpts.ReplicationRequest {
-		return
+		return dsc
 	}
 	// Skip replication if this object's prefix is excluded from being
 	// versioned.
 	if !delOpts.Versioned {
-		return
+		return dsc
 	}
 	opts := replication.ObjectOpts{
 		Name:         dobj.ObjectName,
@@ -391,7 +391,7 @@ func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelet
 			// can be the case that other cluster is down and duplicate `mc rm --vid`
 			// is issued - this still needs to be replicated back to the other target
 			if !oi.VersionPurgeStatus.Empty() {
-				replicate = oi.VersionPurgeStatus == Pending || oi.VersionPurgeStatus == Failed
+				replicate = oi.VersionPurgeStatus == replication.VersionPurgePending || oi.VersionPurgeStatus == replication.VersionPurgeFailed
 				dsc.Set(newReplicateTargetDecision(tgtArn, replicate, sync))
 			}
 			continue
@@ -617,10 +617,10 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 
 	if dobj.VersionID == "" && rinfo.PrevReplicationStatus == replication.Completed && dobj.OpType != replication.ExistingObjectReplicationType {
 		rinfo.ReplicationStatus = rinfo.PrevReplicationStatus
-		return
+		return rinfo
 	}
-	if dobj.VersionID != "" && rinfo.VersionPurgeStatus == Complete {
-		return
+	if dobj.VersionID != "" && rinfo.VersionPurgeStatus == replication.VersionPurgeComplete {
+		return rinfo
 	}
 	if globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
 		replLogOnceIf(ctx, fmt.Errorf("remote target is offline for bucket:%s arn:%s", dobj.Bucket, tgt.ARN), "replication-target-offline-delete-"+tgt.ARN)
@@ -639,9 +639,9 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 		if dobj.VersionID == "" {
 			rinfo.ReplicationStatus = replication.Failed
 		} else {
-			rinfo.VersionPurgeStatus = Failed
+			rinfo.VersionPurgeStatus = replication.VersionPurgeFailed
 		}
-		return
+		return rinfo
 	}
 	// early return if already replicated delete marker for existing object replication/ healing delete markers
 	if dobj.DeleteMarkerVersionID != "" {
@@ -658,13 +658,13 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 			// delete marker already replicated
 			if dobj.VersionID == "" && rinfo.VersionPurgeStatus.Empty() {
 				rinfo.ReplicationStatus = replication.Completed
-				return
+				return rinfo
 			}
 		case isErrObjectNotFound(serr), isErrVersionNotFound(serr):
 			// version being purged is already not found on target.
 			if !rinfo.VersionPurgeStatus.Empty() {
-				rinfo.VersionPurgeStatus = Complete
-				return
+				rinfo.VersionPurgeStatus = replication.VersionPurgeComplete
+				return rinfo
 			}
 		case isErrReadQuorum(serr), isErrWriteQuorum(serr):
 			// destination has some quorum issues, perform removeObject() anyways
@@ -678,7 +678,7 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 			if err != nil && !toi.ReplicationReady {
 				rinfo.ReplicationStatus = replication.Failed
 				rinfo.Err = err
-				return
+				return rinfo
 			}
 		}
 	}
@@ -696,7 +696,7 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 		if dobj.VersionID == "" {
 			rinfo.ReplicationStatus = replication.Failed
 		} else {
-			rinfo.VersionPurgeStatus = Failed
+			rinfo.VersionPurgeStatus = replication.VersionPurgeFailed
 		}
 		replLogIf(ctx, fmt.Errorf("unable to replicate delete marker to %s: %s/%s(%s): %w", tgt.EndpointURL(), tgt.Bucket, dobj.ObjectName, versionID, rmErr))
 		if rmErr != nil && minio.IsNetworkOrHostDown(rmErr, true) && !globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
@@ -706,10 +706,10 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 		if dobj.VersionID == "" {
 			rinfo.ReplicationStatus = replication.Completed
 		} else {
-			rinfo.VersionPurgeStatus = Complete
+			rinfo.VersionPurgeStatus = replication.VersionPurgeComplete
 		}
 	}
-	return
+	return rinfo
 }
 
 func getCopyObjMetadata(oi ObjectInfo, sc string) map[string]string {
@@ -775,13 +775,14 @@ func (m caseInsensitiveMap) Lookup(key string) (string, bool) {
 	return "", false
 }
 
-func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo, partNum int) (putOpts minio.PutObjectOptions, err error) {
+func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (putOpts minio.PutObjectOptions, isMP bool, err error) {
 	meta := make(map[string]string)
 	isSSEC := crypto.SSEC.IsEncrypted(objInfo.UserDefined)
 
 	for k, v := range objInfo.UserDefined {
+		_, isValidSSEHeader := validSSEReplicationHeaders[k]
 		// In case of SSE-C objects copy the allowed internal headers as well
-		if !isSSEC || !slices.Contains(maps.Keys(validSSEReplicationHeaders), k) {
+		if !isSSEC || !isValidSSEHeader {
 			if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
 				continue
 			}
@@ -789,24 +790,26 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo, part
 				continue
 			}
 		}
-		if slices.Contains(maps.Keys(validSSEReplicationHeaders), k) {
+		if isValidSSEHeader {
 			meta[validSSEReplicationHeaders[k]] = v
 		} else {
 			meta[k] = v
 		}
 	}
-
+	isMP = objInfo.isMultipart()
 	if len(objInfo.Checksum) > 0 {
 		// Add encrypted CRC to metadata for SSE-C objects.
 		if isSSEC {
 			meta[ReplicationSsecChecksumHeader] = base64.StdEncoding.EncodeToString(objInfo.Checksum)
 		} else {
-			for _, pi := range objInfo.Parts {
-				if pi.Number == partNum {
-					for k, v := range pi.Checksums {
-						meta[k] = v
-					}
-				}
+			cs, mp := getCRCMeta(objInfo, 0, nil)
+			// Set object checksum.
+			maps.Copy(meta, cs)
+			isMP = mp
+			if !objInfo.isMultipart() && cs[xhttp.AmzChecksumType] == xhttp.AmzChecksumTypeFullObject {
+				// For objects where checksum is full object, it will be the same.
+				// Therefore, we use the cheaper PutObject replication.
+				isMP = false
 			}
 		}
 	}
@@ -837,7 +840,7 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo, part
 			if tagTmstampStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]; ok {
 				tagTimestamp, err = time.Parse(time.RFC3339Nano, tagTmstampStr)
 				if err != nil {
-					return putOpts, err
+					return putOpts, false, err
 				}
 			}
 			putOpts.Internal.TaggingTimestamp = tagTimestamp
@@ -861,7 +864,7 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo, part
 	if retainDateStr, ok := lkMap.Lookup(xhttp.AmzObjectLockRetainUntilDate); ok {
 		rdate, err := amztime.ISO8601Parse(retainDateStr)
 		if err != nil {
-			return putOpts, err
+			return putOpts, false, err
 		}
 		putOpts.RetainUntilDate = rdate
 		// set retention timestamp in opts
@@ -869,7 +872,7 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo, part
 		if retainTmstampStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp]; ok {
 			retTimestamp, err = time.Parse(time.RFC3339Nano, retainTmstampStr)
 			if err != nil {
-				return putOpts, err
+				return putOpts, false, err
 			}
 		}
 		putOpts.Internal.RetentionTimestamp = retTimestamp
@@ -881,7 +884,7 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo, part
 		if lholdTmstampStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp]; ok {
 			lholdTimestamp, err = time.Parse(time.RFC3339Nano, lholdTmstampStr)
 			if err != nil {
-				return putOpts, err
+				return putOpts, false, err
 			}
 		}
 		putOpts.Internal.LegalholdTimestamp = lholdTimestamp
@@ -889,7 +892,25 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo, part
 	if crypto.S3.IsEncrypted(objInfo.UserDefined) {
 		putOpts.ServerSideEncryption = encrypt.NewSSE()
 	}
-	return
+
+	if crypto.S3KMS.IsEncrypted(objInfo.UserDefined) {
+		// If KMS key ID replication is enabled (as by default)
+		// we include the object's KMS key ID. In any case, we
+		// always set the SSE-KMS header. If no KMS key ID is
+		// specified, MinIO is supposed to use whatever default
+		// config applies on the site or bucket.
+		var keyID string
+		if kms.ReplicateKeyID() {
+			keyID = objInfo.KMSKeyID()
+		}
+
+		sseEnc, err := encrypt.NewSSEKMS(keyID, nil)
+		if err != nil {
+			return putOpts, false, err
+		}
+		putOpts.ServerSideEncryption = sseEnc
+	}
+	return putOpts, isMP, err
 }
 
 type replicationAction string
@@ -946,7 +967,9 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 	}
 
 	t, _ := tags.ParseObjectTags(oi1.UserTags)
-	if (oi2.UserTagCount > 0 && !reflect.DeepEqual(oi2.UserTags, t.ToMap())) || (oi2.UserTagCount != len(t.ToMap())) {
+	oi2Map := make(map[string]string)
+	maps.Copy(oi2Map, oi2.UserTags)
+	if (oi2.UserTagCount > 0 && !reflect.DeepEqual(oi2Map, t.ToMap())) || (oi2.UserTagCount != len(t.ToMap())) {
 		return replicateMetadata
 	}
 
@@ -1185,7 +1208,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 	if ri.TargetReplicationStatus(tgt.ARN) == replication.Completed && !ri.ExistingObjResync.Empty() && !ri.ExistingObjResync.mustResyncTarget(tgt.ARN) {
 		rinfo.ReplicationStatus = replication.Completed
 		rinfo.ReplicationResynced = true
-		return
+		return rinfo
 	}
 
 	if globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
@@ -1197,7 +1220,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 			UserAgent:  "Internal: [Replication]",
 			Host:       globalLocalNodeName,
 		})
-		return
+		return rinfo
 	}
 
 	versioned := globalBucketVersioningSys.PrefixEnabled(bucket, object)
@@ -1221,7 +1244,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 			})
 			replLogOnceIf(ctx, fmt.Errorf("unable to read source object %s/%s(%s): %w", bucket, object, objInfo.VersionID, err), object+":"+objInfo.VersionID)
 		}
-		return
+		return rinfo
 	}
 	defer gr.Close()
 
@@ -1245,7 +1268,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 				UserAgent:  "Internal: [Replication]",
 				Host:       globalLocalNodeName,
 			})
-			return
+			return rinfo
 		}
 	}
 
@@ -1274,7 +1297,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 	// use core client to avoid doing multipart on PUT
 	c := &minio.Core{Client: tgt.Client}
 
-	putOpts, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo, 0)
+	putOpts, isMP, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo)
 	if err != nil {
 		replLogIf(ctx, fmt.Errorf("failure setting options for replication bucket:%s err:%w", bucket, err))
 		sendEvent(eventArgs{
@@ -1284,7 +1307,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 			UserAgent:  "Internal: [Replication]",
 			Host:       globalLocalNodeName,
 		})
-		return
+		return rinfo
 	}
 
 	var headerSize int
@@ -1306,7 +1329,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 		defer cancel()
 	}
 	r := bandwidth.NewMonitoredReader(newCtx, globalBucketMonitor, gr, opts)
-	if objInfo.isMultipart() {
+	if isMP {
 		rinfo.Err = replicateObjectWithMultipart(ctx, c, tgt.Bucket, object, r, objInfo, putOpts)
 	} else {
 		_, rinfo.Err = c.PutObject(ctx, tgt.Bucket, object, r, size, "", "", putOpts)
@@ -1321,7 +1344,7 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 			globalBucketTargetSys.markOffline(tgt.EndpointURL())
 		}
 	}
-	return
+	return rinfo
 }
 
 // replicateAll replicates metadata for specified version of the object to destination bucket
@@ -1357,7 +1380,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 			UserAgent:  "Internal: [Replication]",
 			Host:       globalLocalNodeName,
 		})
-		return
+		return rinfo
 	}
 
 	versioned := globalBucketVersioningSys.PrefixEnabled(bucket, object)
@@ -1382,7 +1405,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 			})
 			replLogIf(ctx, fmt.Errorf("unable to replicate to target %s for %s/%s(%s): %w", tgt.EndpointURL(), bucket, object, objInfo.VersionID, err))
 		}
-		return
+		return rinfo
 	}
 	defer gr.Close()
 
@@ -1395,7 +1418,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 	if objInfo.TargetReplicationStatus(tgt.ARN) == replication.Completed && !ri.ExistingObjResync.Empty() && !ri.ExistingObjResync.mustResyncTarget(tgt.ARN) {
 		rinfo.ReplicationStatus = replication.Completed
 		rinfo.ReplicationResynced = true
-		return
+		return rinfo
 	}
 
 	size, err := objInfo.GetActualSize()
@@ -1408,7 +1431,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 			UserAgent:  "Internal: [Replication]",
 			Host:       globalLocalNodeName,
 		})
-		return
+		return rinfo
 	}
 
 	// Set the encrypted size for SSE-C objects
@@ -1435,13 +1458,14 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 		}
 		rinfo.Duration = time.Since(startTime)
 	}()
-
-	oi, cerr := tgt.StatObject(ctx, tgt.Bucket, object, minio.StatObjectOptions{
+	sOpts := minio.StatObjectOptions{
 		VersionID: objInfo.VersionID,
 		Internal: minio.AdvancedGetOptions{
 			ReplicationProxyRequest: "false",
 		},
-	})
+	}
+	sOpts.Set(xhttp.AmzTagDirective, "ACCESS")
+	oi, cerr := tgt.StatObject(ctx, tgt.Bucket, object, sOpts)
 	if cerr == nil {
 		rAction = getReplicationAction(objInfo, oi, ri.OpType)
 		rinfo.ReplicationStatus = replication.Completed
@@ -1470,7 +1494,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 				rinfo.ReplicationAction = rAction
 				rinfo.ReplicationStatus = replication.Completed
 			}
-			return
+			return rinfo
 		}
 	} else {
 		// SSEC objects will refuse HeadObject without the decryption key.
@@ -1504,7 +1528,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 				UserAgent:  "Internal: [Replication]",
 				Host:       globalLocalNodeName,
 			})
-			return
+			return rinfo
 		}
 	}
 applyAction:
@@ -1526,19 +1550,30 @@ applyAction:
 				ReplicationRequest: true, // always set this to distinguish between `mc mirror` replication and serverside
 			},
 		}
-		if tagTmStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]; ok {
+		// default timestamps to ModTime unless present in metadata
+		lkMap := caseInsensitiveMap(objInfo.UserDefined)
+		if _, ok := lkMap.Lookup(xhttp.AmzObjectLockLegalHold); ok {
+			dstOpts.Internal.LegalholdTimestamp = objInfo.ModTime
+		}
+		if _, ok := lkMap.Lookup(xhttp.AmzObjectLockRetainUntilDate); ok {
+			dstOpts.Internal.RetentionTimestamp = objInfo.ModTime
+		}
+		if objInfo.UserTags != "" {
+			dstOpts.Internal.TaggingTimestamp = objInfo.ModTime
+		}
+		if tagTmStr, ok := lkMap.Lookup(ReservedMetadataPrefixLower + TaggingTimestamp); ok {
 			ondiskTimestamp, err := time.Parse(time.RFC3339, tagTmStr)
 			if err == nil {
 				dstOpts.Internal.TaggingTimestamp = ondiskTimestamp
 			}
 		}
-		if retTmStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp]; ok {
+		if retTmStr, ok := lkMap.Lookup(ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp); ok {
 			ondiskTimestamp, err := time.Parse(time.RFC3339, retTmStr)
 			if err == nil {
 				dstOpts.Internal.RetentionTimestamp = ondiskTimestamp
 			}
 		}
-		if lholdTmStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp]; ok {
+		if lholdTmStr, ok := lkMap.Lookup(ReservedMetadataPrefixLower + ObjectLockLegalHoldTimestamp); ok {
 			ondiskTimestamp, err := time.Parse(time.RFC3339, lholdTmStr)
 			if err == nil {
 				dstOpts.Internal.LegalholdTimestamp = ondiskTimestamp
@@ -1549,8 +1584,7 @@ applyAction:
 			replLogIf(ctx, fmt.Errorf("unable to replicate metadata for object %s/%s(%s) to target %s: %w", bucket, objInfo.Name, objInfo.VersionID, tgt.EndpointURL(), rinfo.Err))
 		}
 	} else {
-		var putOpts minio.PutObjectOptions
-		putOpts, err = putReplicationOpts(ctx, tgt.StorageClass, objInfo, 0)
+		putOpts, isMP, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo)
 		if err != nil {
 			replLogIf(ctx, fmt.Errorf("failed to set replicate options for object %s/%s(%s) (target %s) err:%w", bucket, objInfo.Name, objInfo.VersionID, tgt.EndpointURL(), err))
 			sendEvent(eventArgs{
@@ -1560,7 +1594,7 @@ applyAction:
 				UserAgent:  "Internal: [Replication]",
 				Host:       globalLocalNodeName,
 			})
-			return
+			return rinfo
 		}
 		var headerSize int
 		for k, v := range putOpts.Header() {
@@ -1581,7 +1615,7 @@ applyAction:
 			defer cancel()
 		}
 		r := bandwidth.NewMonitoredReader(newCtx, globalBucketMonitor, gr, opts)
-		if objInfo.isMultipart() {
+		if isMP {
 			rinfo.Err = replicateObjectWithMultipart(ctx, c, tgt.Bucket, object, r, objInfo, putOpts)
 		} else {
 			_, rinfo.Err = c.PutObject(ctx, tgt.Bucket, object, r, size, "", "", putOpts)
@@ -1597,7 +1631,7 @@ applyAction:
 			}
 		}
 	}
-	return
+	return rinfo
 }
 
 func replicateObjectWithMultipart(ctx context.Context, c *minio.Core, bucket, object string, r io.Reader, objInfo ObjectInfo, opts minio.PutObjectOptions) (err error) {
@@ -1659,7 +1693,8 @@ func replicateObjectWithMultipart(ctx context.Context, c *minio.Core, bucket, ob
 		cHeader := http.Header{}
 		cHeader.Add(xhttp.MinIOSourceReplicationRequest, "true")
 		if !isSSEC {
-			for k, v := range partInfo.Checksums {
+			cs, _ := getCRCMeta(objInfo, partInfo.Number, nil)
+			for k, v := range cs {
 				cHeader.Add(k, v)
 			}
 		}
@@ -1683,12 +1718,13 @@ func replicateObjectWithMultipart(ctx context.Context, c *minio.Core, bucket, ob
 			return fmt.Errorf("ssec(%t): Part size mismatch: got %d, want %d", isSSEC, pInfo.Size, size)
 		}
 		uploadedParts = append(uploadedParts, minio.CompletePart{
-			PartNumber:     pInfo.PartNumber,
-			ETag:           pInfo.ETag,
-			ChecksumCRC32:  pInfo.ChecksumCRC32,
-			ChecksumCRC32C: pInfo.ChecksumCRC32C,
-			ChecksumSHA1:   pInfo.ChecksumSHA1,
-			ChecksumSHA256: pInfo.ChecksumSHA256,
+			PartNumber:        pInfo.PartNumber,
+			ETag:              pInfo.ETag,
+			ChecksumCRC32:     pInfo.ChecksumCRC32,
+			ChecksumCRC32C:    pInfo.ChecksumCRC32C,
+			ChecksumSHA1:      pInfo.ChecksumSHA1,
+			ChecksumSHA256:    pInfo.ChecksumSHA256,
+			ChecksumCRC64NVME: pInfo.ChecksumCRC64NVME,
 		})
 	}
 	userMeta := map[string]string{
@@ -1701,6 +1737,13 @@ func replicateObjectWithMultipart(ctx context.Context, c *minio.Core, bucket, ob
 	// really big value but its okay on heavily loaded systems. This is just tail end timeout.
 	cctx, ccancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer ccancel()
+
+	if len(objInfo.Checksum) > 0 {
+		cs, _ := getCRCMeta(objInfo, 0, nil)
+		for k, v := range cs {
+			userMeta[k] = strings.Split(v, "-")[0]
+		}
+	}
 	_, err = c.CompleteMultipartUpload(cctx, bucket, object, uploadID, uploadedParts, minio.PutObjectOptions{
 		UserMetadata: userMeta,
 		Internal: minio.AdvancedPutOptions{
@@ -1724,9 +1767,7 @@ func filterReplicationStatusMetadata(metadata map[string]string) map[string]stri
 		}
 		if !copied {
 			dst = make(map[string]string, len(metadata))
-			for k, v := range metadata {
-				dst[k] = v
-			}
+			maps.Copy(dst, metadata)
 			copied = true
 		}
 		delete(dst, key)
@@ -2636,7 +2677,7 @@ func (c replicationConfig) Replicate(opts replication.ObjectOpts) bool {
 // Resync returns true if replication reset is requested
 func (c replicationConfig) Resync(ctx context.Context, oi ObjectInfo, dsc ReplicateDecision, tgtStatuses map[string]replication.StatusType) (r ResyncDecision) {
 	if c.Empty() {
-		return
+		return r
 	}
 
 	// Now overlay existing object replication choices for target
@@ -2652,7 +2693,7 @@ func (c replicationConfig) Resync(ctx context.Context, oi ObjectInfo, dsc Replic
 		tgtArns := c.Config.FilterTargetArns(opts)
 		// indicates no matching target with Existing object replication enabled.
 		if len(tgtArns) == 0 {
-			return
+			return r
 		}
 		for _, t := range tgtArns {
 			opts.TargetArn = t
@@ -2678,7 +2719,7 @@ func (c replicationConfig) resync(oi ObjectInfo, dsc ReplicateDecision, tgtStatu
 		targets: make(map[string]ResyncTargetDecision, len(dsc.targetsMap)),
 	}
 	if c.remotes == nil {
-		return
+		return r
 	}
 	for _, tgt := range c.remotes.Targets {
 		d, ok := dsc.targetsMap[tgt.Arn]
@@ -2690,7 +2731,7 @@ func (c replicationConfig) resync(oi ObjectInfo, dsc ReplicateDecision, tgtStatu
 		}
 		r.targets[d.Arn] = resyncTarget(oi, tgt.Arn, tgt.ResetID, tgt.ResetBeforeDate, tgtStatuses[tgt.Arn])
 	}
-	return
+	return r
 }
 
 func targetResetHeader(arn string) string {
@@ -2709,28 +2750,28 @@ func resyncTarget(oi ObjectInfo, arn string, resetID string, resetBeforeDate tim
 	if !ok { // existing object replication is enabled and object version is unreplicated so far.
 		if resetID != "" && oi.ModTime.Before(resetBeforeDate) { // trigger replication if `mc replicate reset` requested
 			rd.Replicate = true
-			return
+			return rd
 		}
 		// For existing object reset - this condition is needed
 		rd.Replicate = tgtStatus == ""
-		return
+		return rd
 	}
 	if resetID == "" || resetBeforeDate.Equal(timeSentinel) { // no reset in progress
-		return
+		return rd
 	}
 
 	// if already replicated, return true if a new reset was requested.
 	splits := strings.SplitN(rs, ";", 2)
 	if len(splits) != 2 {
-		return
+		return rd
 	}
 	newReset := splits[1] != resetID
 	if !newReset && tgtStatus == replication.Completed {
 		// already replicated and no reset requested
-		return
+		return rd
 	}
 	rd.Replicate = newReset && oi.ModTime.Before(resetBeforeDate)
-	return
+	return rd
 }
 
 const resyncTimeInterval = time.Minute * 1
@@ -2908,7 +2949,7 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 	}()
 
 	var wg sync.WaitGroup
-	for i := 0; i < resyncParallelRoutines; i++ {
+	for i := range resyncParallelRoutines {
 		wg.Add(1)
 		workers[i] = make(chan ReplicateObjectInfo, 100)
 		i := i
@@ -3017,7 +3058,7 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 			workers[h%uint64(resyncParallelRoutines)] <- roi
 		}
 	}
-	for i := 0; i < resyncParallelRoutines; i++ {
+	for i := range resyncParallelRoutines {
 		xioutil.SafeClose(workers[i])
 	}
 	wg.Wait()
@@ -3147,11 +3188,9 @@ func (p *ReplicationPool) startResyncRoutine(ctx context.Context, buckets []stri
 			<-ctx.Done()
 			return
 		}
-		duration := time.Duration(r.Float64() * float64(time.Minute))
-		if duration < time.Second {
+		duration := max(time.Duration(r.Float64()*float64(time.Minute)),
 			// Make sure to sleep at least a second to avoid high CPU ticks.
-			duration = time.Second
-		}
+			time.Second)
 		time.Sleep(duration)
 	}
 }
@@ -3317,7 +3356,7 @@ func getReplicationDiff(ctx context.Context, objAPI ObjectLayer, bucket string, 
 				}
 				for arn, st := range roi.TargetPurgeStatuses {
 					if opts.ARN == "" || opts.ARN == arn {
-						if !opts.Verbose && st == Complete {
+						if !opts.Verbose && st == replication.VersionPurgeComplete {
 							continue
 						}
 						t, ok := tgtsMap[arn]
@@ -3383,12 +3422,12 @@ func queueReplicationHeal(ctx context.Context, bucket string, oi ObjectInfo, rcf
 	roi = getHealReplicateObjectInfo(oi, rcfg)
 	roi.RetryCount = uint32(retryCount)
 	if !roi.Dsc.ReplicateAny() {
-		return
+		return roi
 	}
 	// early return if replication already done, otherwise we need to determine if this
 	// version is an existing object that needs healing.
 	if oi.ReplicationStatus == replication.Completed && oi.VersionPurgeStatus.Empty() && !roi.ExistingObjResync.mustResync() {
-		return
+		return roi
 	}
 
 	if roi.DeleteMarker || !roi.VersionPurgeStatus.Empty() {
@@ -3416,16 +3455,16 @@ func queueReplicationHeal(ctx context.Context, bucket string, oi ObjectInfo, rcf
 		// heal delete marker replication failure or versioned delete replication failure
 		if roi.ReplicationStatus == replication.Pending ||
 			roi.ReplicationStatus == replication.Failed ||
-			roi.VersionPurgeStatus == Failed || roi.VersionPurgeStatus == Pending {
+			roi.VersionPurgeStatus == replication.VersionPurgeFailed || roi.VersionPurgeStatus == replication.VersionPurgePending {
 			globalReplicationPool.Get().queueReplicaDeleteTask(dv)
-			return
+			return roi
 		}
 		// if replication status is Complete on DeleteMarker and existing object resync required
 		if roi.ExistingObjResync.mustResync() && (roi.ReplicationStatus == replication.Completed || roi.ReplicationStatus.Empty()) {
 			queueReplicateDeletesWrapper(dv, roi.ExistingObjResync)
-			return
+			return roi
 		}
-		return
+		return roi
 	}
 	if roi.ExistingObjResync.mustResync() {
 		roi.OpType = replication.ExistingObjectReplicationType
@@ -3434,13 +3473,13 @@ func queueReplicationHeal(ctx context.Context, bucket string, oi ObjectInfo, rcf
 	case replication.Pending, replication.Failed:
 		roi.EventType = ReplicateHeal
 		globalReplicationPool.Get().queueReplicaTask(roi)
-		return
+		return roi
 	}
 	if roi.ExistingObjResync.mustResync() {
 		roi.EventType = ReplicateExisting
 		globalReplicationPool.Get().queueReplicaTask(roi)
 	}
-	return
+	return roi
 }
 
 const (
@@ -3704,7 +3743,7 @@ func (p *ReplicationPool) queueMRFHeal() error {
 }
 
 func (p *ReplicationPool) initialized() bool {
-	return !(p == nil || p.objLayer == nil)
+	return p != nil && p.objLayer != nil
 }
 
 // getMRF returns MRF entries for this node.
@@ -3745,4 +3784,20 @@ type validateReplicationDestinationOptions struct {
 	CheckReady        bool
 
 	checkReadyErr sync.Map
+}
+
+func getCRCMeta(oi ObjectInfo, partNum int, h http.Header) (cs map[string]string, isMP bool) {
+	meta := make(map[string]string)
+	cs, isMP = oi.decryptChecksums(partNum, h)
+	for k, v := range cs {
+		if k == xhttp.AmzChecksumType {
+			continue
+		}
+		cktype := hash.ChecksumStringToType(k)
+		if cktype.IsSet() {
+			meta[cktype.Key()] = v
+			meta[xhttp.AmzChecksumAlgo] = cktype.String()
+		}
+	}
+	return meta, isMP
 }

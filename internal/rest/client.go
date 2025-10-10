@@ -210,13 +210,13 @@ type respBodyMonitor struct {
 func (r *respBodyMonitor) Read(p []byte) (n int, err error) {
 	n, err = r.ReadCloser.Read(p)
 	r.errorStatus(err)
-	return
+	return n, err
 }
 
 func (r *respBodyMonitor) Close() (err error) {
 	err = r.ReadCloser.Close()
 	r.errorStatus(err)
-	return
+	return err
 }
 
 func (r *respBodyMonitor) errorStatus(err error) {
@@ -284,7 +284,6 @@ func (c *Client) dumpHTTP(req *http.Request, resp *http.Response) {
 	}
 
 	// Returns success.
-	return
 }
 
 // ErrClientClosed returned when *Client is closed.
@@ -448,7 +447,7 @@ func (c *Client) LastError() error {
 
 // computes the exponential backoff duration according to
 // https://www.awsarchitectureblog.com/2015/03/backoff.html
-func exponentialBackoffWait(r *rand.Rand, unit, cap time.Duration) func(uint) time.Duration {
+func exponentialBackoffWait(r *rand.Rand, unit, maxSleep time.Duration) func(uint) time.Duration {
 	if unit > time.Hour {
 		// Protect against integer overflow
 		panic("unit cannot exceed one hour")
@@ -459,10 +458,7 @@ func exponentialBackoffWait(r *rand.Rand, unit, cap time.Duration) func(uint) ti
 			attempt = 16
 		}
 		// sleep = random_between(unit, min(cap, base * 2 ** attempt))
-		sleep := unit * time.Duration(1<<attempt)
-		if sleep > cap {
-			sleep = cap
-		}
+		sleep := min(unit*time.Duration(1<<attempt), maxSleep)
 		sleep -= time.Duration(r.Float64() * float64(sleep-unit))
 		return sleep
 	}

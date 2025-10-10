@@ -60,7 +60,7 @@ type nodesOnline struct {
 func newNodesUpDownCache() *cachevalue.Cache[nodesOnline] {
 	loadNodesUpDown := func(ctx context.Context) (v nodesOnline, err error) {
 		v.Online, v.Offline = globalNotificationSys.GetPeerOnlineCount()
-		return
+		return v, err
 	}
 	return cachevalue.NewFromFunc(1*time.Minute,
 		cachevalue.Opts{ReturnLastGood: true},
@@ -88,12 +88,12 @@ func newDataUsageInfoCache() *cachevalue.Cache[DataUsageInfo] {
 	loadDataUsage := func(ctx context.Context) (u DataUsageInfo, err error) {
 		objLayer := newObjectLayerFn()
 		if objLayer == nil {
-			return
+			return u, err
 		}
 
 		// Collect cluster level object metrics.
 		u, err = loadDataUsageFromBackend(GlobalContext, objLayer)
-		return
+		return u, err
 	}
 	return cachevalue.NewFromFunc(1*time.Minute,
 		cachevalue.Opts{ReturnLastGood: true},
@@ -104,11 +104,11 @@ func newESetHealthResultCache() *cachevalue.Cache[HealthResult] {
 	loadHealth := func(ctx context.Context) (r HealthResult, err error) {
 		objLayer := newObjectLayerFn()
 		if objLayer == nil {
-			return
+			return r, err
 		}
 
 		r = objLayer.Health(GlobalContext, HealthOptions{})
-		return
+		return r, err
 	}
 	return cachevalue.NewFromFunc(1*time.Minute,
 		cachevalue.Opts{ReturnLastGood: true},
@@ -146,7 +146,7 @@ func getDriveIOStatMetrics(ioStats madmin.DiskIOStats, duration time.Duration) (
 	// TotalTicks is in milliseconds
 	m.percUtil = float64(ioStats.TotalTicks) * 100 / (durationSecs * 1000)
 
-	return
+	return m
 }
 
 func newDriveMetricsCache() *cachevalue.Cache[storageMetrics] {
@@ -161,7 +161,7 @@ func newDriveMetricsCache() *cachevalue.Cache[storageMetrics] {
 	loadDriveMetrics := func(ctx context.Context) (v storageMetrics, err error) {
 		objLayer := newObjectLayerFn()
 		if objLayer == nil {
-			return
+			return v, err
 		}
 
 		storageInfo := objLayer.LocalStorageInfo(GlobalContext, true)
@@ -195,7 +195,7 @@ func newDriveMetricsCache() *cachevalue.Cache[storageMetrics] {
 		prevDriveIOStatsRefreshedAt = now
 		prevDriveIOStatsMu.Unlock()
 
-		return
+		return v, err
 	}
 
 	return cachevalue.NewFromFunc(1*time.Minute,
@@ -205,7 +205,7 @@ func newDriveMetricsCache() *cachevalue.Cache[storageMetrics] {
 
 func newCPUMetricsCache() *cachevalue.Cache[madmin.CPUMetrics] {
 	loadCPUMetrics := func(ctx context.Context) (v madmin.CPUMetrics, err error) {
-		var types madmin.MetricType = madmin.MetricsCPU
+		types := madmin.MetricsCPU
 
 		m := collectLocalMetrics(types, collectMetricsOpts{
 			hosts: map[string]struct{}{
@@ -220,7 +220,7 @@ func newCPUMetricsCache() *cachevalue.Cache[madmin.CPUMetrics] {
 			}
 		}
 
-		return
+		return v, err
 	}
 
 	return cachevalue.NewFromFunc(1*time.Minute,
@@ -230,7 +230,7 @@ func newCPUMetricsCache() *cachevalue.Cache[madmin.CPUMetrics] {
 
 func newMemoryMetricsCache() *cachevalue.Cache[madmin.MemInfo] {
 	loadMemoryMetrics := func(ctx context.Context) (v madmin.MemInfo, err error) {
-		var types madmin.MetricType = madmin.MetricsMem
+		types := madmin.MetricsMem
 
 		m := collectLocalMetrics(types, collectMetricsOpts{
 			hosts: map[string]struct{}{
@@ -245,7 +245,7 @@ func newMemoryMetricsCache() *cachevalue.Cache[madmin.MemInfo] {
 			}
 		}
 
-		return
+		return v, err
 	}
 
 	return cachevalue.NewFromFunc(1*time.Minute,
@@ -268,7 +268,7 @@ func newClusterStorageInfoCache() *cachevalue.Cache[storageMetrics] {
 			offlineDrives: offlineDrives.Sum(),
 			totalDrives:   totalDrives.Sum(),
 		}
-		return
+		return v, err
 	}
 	return cachevalue.NewFromFunc(1*time.Minute,
 		cachevalue.Opts{ReturnLastGood: true},

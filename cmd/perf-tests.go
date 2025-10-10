@@ -338,10 +338,7 @@ func netperf(ctx context.Context, duration time.Duration) madmin.NetperfNodeResu
 	time.Sleep(duration)
 	xioutil.SafeClose(r.eof)
 	wg.Wait()
-	for {
-		if globalNetPerfRX.ActiveConnections() == 0 {
-			break
-		}
+	for globalNetPerfRX.ActiveConnections() != 0 {
 		time.Sleep(time.Second)
 	}
 	rx := float64(globalNetPerfRX.RXSample)
@@ -378,7 +375,7 @@ func siteNetperf(ctx context.Context, duration time.Duration) madmin.SiteNetPerf
 		}
 		info := info
 		wg.Add(connectionsPerPeer)
-		for i := 0; i < connectionsPerPeer; i++ {
+		for range connectionsPerPeer {
 			go func() {
 				defer wg.Done()
 				ctx, cancel := context.WithTimeout(ctx, duration+10*time.Second)
@@ -396,10 +393,7 @@ func siteNetperf(ctx context.Context, duration time.Duration) madmin.SiteNetPerf
 	time.Sleep(duration)
 	xioutil.SafeClose(r.eof)
 	wg.Wait()
-	for {
-		if globalSiteNetPerfRX.ActiveConnections() == 0 || contextCanceled(ctx) {
-			break
-		}
+	for globalSiteNetPerfRX.ActiveConnections() != 0 && !contextCanceled(ctx) {
 		time.Sleep(time.Second)
 	}
 	rx := float64(globalSiteNetPerfRX.RXSample)
@@ -428,7 +422,7 @@ func perfNetRequest(ctx context.Context, deploymentID, reqPath string, reader io
 	cli, err := globalSiteReplicationSys.getAdminClient(ctx, deploymentID)
 	if err != nil {
 		result.Error = err.Error()
-		return
+		return result
 	}
 	rp := cli.GetEndpointURL()
 	reqURL := &url.URL{
@@ -440,7 +434,7 @@ func perfNetRequest(ctx context.Context, deploymentID, reqPath string, reader io
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL.String(), reader)
 	if err != nil {
 		result.Error = err.Error()
-		return
+		return result
 	}
 	client := &http.Client{
 		Transport: globalRemoteTargetTransport,
@@ -448,7 +442,7 @@ func perfNetRequest(ctx context.Context, deploymentID, reqPath string, reader io
 	resp, err := client.Do(req)
 	if err != nil {
 		result.Error = err.Error()
-		return
+		return result
 	}
 	defer xhttp.DrainBody(resp.Body)
 	err = gob.NewDecoder(resp.Body).Decode(&result)
@@ -457,5 +451,5 @@ func perfNetRequest(ctx context.Context, deploymentID, reqPath string, reader io
 	if err != nil {
 		result.Error = err.Error()
 	}
-	return
+	return result
 }

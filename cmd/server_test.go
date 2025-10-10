@@ -37,6 +37,7 @@ import (
 	"github.com/dustin/go-humanize"
 	jwtgo "github.com/golang-jwt/jwt/v4"
 	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio-go/v7/pkg/signer"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/pkg/v3/policy"
 )
@@ -59,7 +60,7 @@ type check struct {
 }
 
 // Assert - checks if gotValue is same as expectedValue, if not fails the test.
-func (c *check) Assert(gotValue interface{}, expectedValue interface{}) {
+func (c *check) Assert(gotValue any, expectedValue any) {
 	c.Helper()
 	if !reflect.DeepEqual(gotValue, expectedValue) {
 		c.Fatalf("Test %s expected %v, got %v", c.testType, expectedValue, gotValue)
@@ -126,6 +127,7 @@ func runAllTests(suite *TestSuiteCommon, c *check) {
 	suite.TestMetricsV3Handler(c)
 	suite.TestBucketSQSNotificationWebHook(c)
 	suite.TestBucketSQSNotificationAMQP(c)
+	suite.TestUnsignedCVE(c)
 	suite.TearDownSuite(c)
 }
 
@@ -352,6 +354,59 @@ func (s *TestSuiteCommon) TestObjectDir(c *check) {
 
 	c.Assert(err, nil)
 	c.Assert(response.StatusCode, http.StatusNoContent)
+}
+
+func (s *TestSuiteCommon) TestUnsignedCVE(c *check) {
+	c.Helper()
+
+	// generate a random bucket Name.
+	bucketName := getRandomBucketName()
+
+	// HTTP request to create the bucket.
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	// execute the request.
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+
+	// assert the http response status code.
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	req, err := http.NewRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, "test-cve-object.txt"), nil)
+	c.Assert(err, nil)
+
+	req.Body = io.NopCloser(bytes.NewReader([]byte("foobar!\n")))
+	req.Trailer = http.Header{}
+	req.Trailer.Set("x-amz-checksum-crc32", "rK0DXg==")
+
+	now := UTCNow()
+
+	req = signer.StreamingUnsignedV4(req, "", 8, now)
+
+	maliciousHeaders := http.Header{
+		"Authorization":                []string{fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/us-east-1/s3/aws4_request, SignedHeaders=invalidheader, Signature=deadbeefdeadbeefdeadbeeddeadbeeddeadbeefdeadbeefdeadbeefdeadbeef", s.accessKey, now.Format(yyyymmdd))},
+		"User-Agent":                   []string{"A malicious request"},
+		"X-Amz-Decoded-Content-Length": []string{"8"},
+		"Content-Encoding":             []string{"aws-chunked"},
+		"X-Amz-Trailer":                []string{"x-amz-checksum-crc32"},
+		"x-amz-content-sha256":         []string{unsignedPayloadTrailer},
+	}
+
+	for k, v := range maliciousHeaders {
+		req.Header.Set(k, v[0])
+	}
+
+	// execute the request.
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+
+	// out, err = httputil.DumpResponse(response, true)
+	// fmt.Println("RESPONSE ===\n", string(out), err)
+
+	// assert the http response status code.
+	c.Assert(response.StatusCode, http.StatusBadRequest)
 }
 
 func (s *TestSuiteCommon) TestBucketSQSNotificationAMQP(c *check) {
@@ -598,7 +653,7 @@ func (s *TestSuiteCommon) TestDeleteMultipleObjects(c *check) {
 	delObjReq := DeleteObjectsRequest{
 		Quiet: false,
 	}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		// Obtain http request to upload object.
 		// object Name contains a prefix.
 		objName := fmt.Sprintf("%d/%s", i, objectName)
@@ -635,7 +690,7 @@ func (s *TestSuiteCommon) TestDeleteMultipleObjects(c *check) {
 	c.Assert(err, nil)
 	err = xml.Unmarshal(delRespBytes, &deleteResp)
 	c.Assert(err, nil)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		// All the objects should be under deleted list (including non-existent object)
 		c.Assert(deleteResp.DeletedObjects[i], DeletedObject{
 			ObjectName: delObjReq.Objects[i].ObjectName,
@@ -659,7 +714,7 @@ func (s *TestSuiteCommon) TestDeleteMultipleObjects(c *check) {
 	err = xml.Unmarshal(delRespBytes, &deleteResp)
 	c.Assert(err, nil)
 	c.Assert(len(deleteResp.DeletedObjects), len(delObjReq.Objects))
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		c.Assert(deleteResp.DeletedObjects[i], DeletedObject{
 			ObjectName: delObjReq.Objects[i].ObjectName,
 			VersionID:  delObjReq.Objects[i].VersionID,
@@ -999,7 +1054,7 @@ func (s *TestSuiteCommon) TestPutBucket(c *check) {
 	// The purpose this block is not to check for correctness of functionality
 	// Run the test with -race flag to utilize this
 	var wg sync.WaitGroup
-	for i := 0; i < testConcurrencyLevel; i++ {
+	for range testConcurrencyLevel {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -2072,7 +2127,7 @@ func (s *TestSuiteCommon) TestGetObjectLarge10MiB(c *check) {
 	1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,
 	1234567890,1234567890,1234567890,1234567890,1234567890,123"`
 	// Create 10MiB content where each line contains 1024 characters.
-	for i := 0; i < 10*1024; i++ {
+	for i := range 10 * 1024 {
 		buffer.WriteString(fmt.Sprintf("[%05d] %s\n", i, line))
 	}
 	putContent := buffer.String()
@@ -2134,7 +2189,7 @@ func (s *TestSuiteCommon) TestGetObjectLarge11MiB(c *check) {
 	1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,
 	1234567890,1234567890,1234567890,123`
 	// Create 11MiB content where each line contains 1024 characters.
-	for i := 0; i < 11*1024; i++ {
+	for i := range 11 * 1024 {
 		buffer.WriteString(fmt.Sprintf("[%05d] %s\n", i, line))
 	}
 	putMD5 := getMD5Hash(buffer.Bytes())
@@ -2285,7 +2340,7 @@ func (s *TestSuiteCommon) TestGetPartialObjectLarge11MiB(c *check) {
 	1234567890,1234567890,1234567890,123`
 	// Create 11MiB content where each line contains 1024
 	// characters.
-	for i := 0; i < 11*1024; i++ {
+	for i := range 11 * 1024 {
 		buffer.WriteString(fmt.Sprintf("[%05d] %s\n", i, line))
 	}
 	putContent := buffer.String()
@@ -2351,7 +2406,7 @@ func (s *TestSuiteCommon) TestGetPartialObjectLarge10MiB(c *check) {
 	1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,1234567890,
 	1234567890,1234567890,1234567890,123`
 	// Create 10MiB content where each line contains 1024 characters.
-	for i := 0; i < 10*1024; i++ {
+	for i := range 10 * 1024 {
 		buffer.WriteString(fmt.Sprintf("[%05d] %s\n", i, line))
 	}
 

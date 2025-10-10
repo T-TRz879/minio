@@ -24,9 +24,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/minio/madmin-go/v3/logger/log"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v3/logger/message/log"
 )
 
 // Target implements loggerTarget to send log
@@ -50,7 +50,7 @@ func (c *Target) String() string {
 }
 
 // Send log message 'e' to console
-func (c *Target) Send(e interface{}) error {
+func (c *Target) Send(e any) error {
 	entry, ok := e.(log.Entry)
 	if !ok {
 		return fmt.Errorf("Uexpected log entry structure %#v", e)

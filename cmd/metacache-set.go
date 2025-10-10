@@ -25,10 +25,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -161,16 +163,41 @@ func (o listPathOptions) newMetacache() metacache {
 	}
 }
 
-func (o *listPathOptions) debugf(format string, data ...interface{}) {
+func (o *listPathOptions) debugf(format string, data ...any) {
 	if serverDebugLog {
 		console.Debugf(format+"\n", data...)
 	}
 }
 
-func (o *listPathOptions) debugln(data ...interface{}) {
+func (o *listPathOptions) debugln(data ...any) {
 	if serverDebugLog {
 		console.Debugln(data...)
 	}
+}
+
+func (o *listPathOptions) shouldSkip(ctx context.Context, entry metaCacheEntry) (yes bool) {
+	if !o.IncludeDirectories && (entry.isDir() || (!o.Versioned && entry.isObjectDir() && entry.isLatestDeletemarker())) {
+		return true
+	}
+	if o.Marker != "" && entry.name < o.Marker {
+		return true
+	}
+	if !strings.HasPrefix(entry.name, o.Prefix) {
+		return true
+	}
+	if o.Separator != "" && entry.isDir() && !strings.Contains(strings.TrimPrefix(entry.name, o.Prefix), o.Separator) {
+		return true
+	}
+	if !o.Recursive && !entry.isInDir(o.Prefix, o.Separator) {
+		return true
+	}
+	if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
+		return true
+	}
+	if o.Lifecycle != nil || o.Replication.Config != nil {
+		return triggerExpiryAndRepl(ctx, *o, entry)
+	}
+	return false
 }
 
 // gatherResults will collect all results on the input channel and filter results according
@@ -182,8 +209,7 @@ func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCache
 	resultsDone := make(chan metaCacheEntriesSorted)
 	// Copy so we can mutate
 	resCh := resultsDone
-	var done bool
-	var mu sync.Mutex
+	var done atomic.Bool
 	resErr := io.EOF
 
 	go func() {
@@ -194,33 +220,17 @@ func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCache
 				// past limit
 				continue
 			}
-			mu.Lock()
-			returned = done
-			mu.Unlock()
+			returned = done.Load()
 			if returned {
 				resCh = nil
 				continue
 			}
-			if !o.IncludeDirectories && (entry.isDir() || (!o.Versioned && entry.isObjectDir() && entry.isLatestDeletemarker())) {
-				continue
-			}
-			if o.Marker != "" && entry.name < o.Marker {
-				continue
-			}
-			if !strings.HasPrefix(entry.name, o.Prefix) {
-				continue
-			}
-			if !o.Recursive && !entry.isInDir(o.Prefix, o.Separator) {
-				continue
-			}
-			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
-				continue
-			}
-			if o.Lifecycle != nil || o.Replication.Config != nil {
-				if skipped := triggerExpiryAndRepl(ctx, *o, entry); skipped == true {
+			if yes := o.shouldSkip(ctx, entry); yes {
+				// when we have not enough results, record the skipped entry
+				if o.Limit > 0 && results.len() < o.Limit {
 					results.lastSkippedEntry = entry.name
-					continue
 				}
+				continue
 			}
 			if o.Limit > 0 && results.len() >= o.Limit {
 				// We have enough and we have more.
@@ -250,9 +260,7 @@ func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCache
 	return func() (metaCacheEntriesSorted, error) {
 		select {
 		case <-ctx.Done():
-			mu.Lock()
-			done = true
-			mu.Unlock()
+			done.Store(true)
 			return metaCacheEntriesSorted{}, ctx.Err()
 		case r := <-resultsDone:
 			return r, resErr
@@ -626,18 +634,18 @@ func calcCommonWritesDeletes(infos []DiskInfo, readQuorum int) (commonWrite, com
 	}
 
 	filter := func(list []uint64) (commonCount uint64) {
-		max := 0
+		maxCnt := 0
 		signatureMap := map[uint64]int{}
 		for _, v := range list {
 			signatureMap[v]++
 		}
 		for ops, count := range signatureMap {
-			if max < count && commonCount < ops {
-				max = count
+			if maxCnt < count && commonCount < ops {
+				maxCnt = count
 				commonCount = ops
 			}
 		}
-		if max < readQuorum {
+		if maxCnt < readQuorum {
 			return 0
 		}
 		return commonCount
@@ -645,12 +653,12 @@ func calcCommonWritesDeletes(infos []DiskInfo, readQuorum int) (commonWrite, com
 
 	commonWrite = filter(writes)
 	commonDelete = filter(deletes)
-	return
+	return commonWrite, commonDelete
 }
 
 func calcCommonCounter(infos []DiskInfo, readQuorum int) (commonCount uint64) {
 	filter := func() (commonCount uint64) {
-		max := 0
+		maxCnt := 0
 		signatureMap := map[uint64]int{}
 		for _, info := range infos {
 			if info.Error != "" {
@@ -660,12 +668,12 @@ func calcCommonCounter(infos []DiskInfo, readQuorum int) (commonCount uint64) {
 			signatureMap[mutations]++
 		}
 		for ops, count := range signatureMap {
-			if max < count && commonCount < ops {
-				max = count
+			if maxCnt < count && commonCount < ops {
+				maxCnt = count
 				commonCount = ops
 			}
 		}
-		if max < readQuorum {
+		if maxCnt < readQuorum {
 			return 0
 		}
 		return commonCount
@@ -899,9 +907,7 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 			fi := FileInfo{
 				Metadata: make(map[string]string, len(meta)),
 			}
-			for k, v := range meta {
-				fi.Metadata[k] = v
-			}
+			maps.Copy(fi.Metadata, meta)
 			err := er.updateObjectMetaWithOpts(ctx, minioMetaBucket, o.objectPath(0), fi, er.getDisks(), UpdateMetadataOpts{NoPersistence: true})
 			if err == nil {
 				break
@@ -1114,7 +1120,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 					continue
 				}
 				hasErr++
-				errs[i] = err
+				errs[i] = fmt.Errorf("drive: %s returned err: %v", disks[i], err)
 				continue
 			}
 			// If no current, add it.
@@ -1163,18 +1169,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			if opts.finished != nil {
 				opts.finished(errs)
 			}
-			var combinedErr []string
-			for i, err := range errs {
-				if err != nil {
-					if disks[i] != nil {
-						combinedErr = append(combinedErr,
-							fmt.Sprintf("drive %s returned: %s", disks[i], err))
-					} else {
-						combinedErr = append(combinedErr, err.Error())
-					}
-				}
-			}
-			return errors.New(strings.Join(combinedErr, ", "))
+			return errors.Join(errs...)
 		}
 
 		// Break if all at EOF or error.

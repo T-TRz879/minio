@@ -25,10 +25,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"syscall"
 	"unsafe"
 
+	"github.com/minio/minio/internal/bpool"
 	"golang.org/x/sys/unix"
 )
 
@@ -106,15 +106,15 @@ const blockSize = 8 << 10 // 8192
 
 // By default at least 128 entries in single getdents call (1MiB buffer)
 var (
-	direntPool = sync.Pool{
-		New: func() interface{} {
+	direntPool = bpool.Pool[*[]byte]{
+		New: func() *[]byte {
 			buf := make([]byte, blockSize*128)
 			return &buf
 		},
 	}
 
-	direntNamePool = sync.Pool{
-		New: func() interface{} {
+	direntNamePool = bpool.Pool[*[]byte]{
+		New: func() *[]byte {
 			buf := make([]byte, blockSize)
 			return &buf
 		},
@@ -136,7 +136,7 @@ func parseDirEnt(buf []byte) (consumed int, name []byte, typ os.FileMode, err er
 	}
 	consumed = int(dirent.Reclen)
 	if direntInode(dirent) == 0 { // File absent in directory.
-		return
+		return consumed, name, typ, err
 	}
 	switch dirent.Type {
 	case syscall.DT_REG:
@@ -183,11 +183,10 @@ func readDirFn(dirPath string, fn func(name string, typ os.FileMode) error) erro
 			}
 			return osErrToFileErr(err)
 		}
-
 	}
 	defer syscall.Close(fd)
 
-	bufp := direntPool.Get().(*[]byte)
+	bufp := direntPool.Get()
 	defer direntPool.Put(bufp)
 	buf := *bufp
 
@@ -273,11 +272,11 @@ func readDirWithOpts(dirPath string, opts readDirOpts) (entries []string, err er
 	}
 	defer syscall.Close(fd)
 
-	bufp := direntPool.Get().(*[]byte)
+	bufp := direntPool.Get()
 	defer direntPool.Put(bufp)
 	buf := *bufp
 
-	nameTmp := direntNamePool.Get().(*[]byte)
+	nameTmp := direntNamePool.Get()
 	defer direntNamePool.Put(nameTmp)
 	tmp := *nameTmp
 
@@ -350,7 +349,7 @@ func readDirWithOpts(dirPath string, opts readDirOpts) (entries []string, err er
 		entries = append(entries, nameStr)
 	}
 
-	return
+	return entries, err
 }
 
 func globalSync() {

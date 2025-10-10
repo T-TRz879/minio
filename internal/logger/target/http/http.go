@@ -35,7 +35,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger/target/types"
+	types "github.com/minio/minio/internal/logger/target/loggertypes"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
 	xnet "github.com/minio/pkg/v3/net"
@@ -43,8 +43,6 @@ import (
 )
 
 const (
-	// Timeout for the webhook http call
-	webhookCallTimeout = 5 * time.Second
 
 	// maxWorkers is the maximum number of concurrent http loggers
 	maxWorkers = 16
@@ -63,29 +61,30 @@ const (
 )
 
 var (
-	logChBuffers = make(map[string]chan interface{})
+	logChBuffers = make(map[string]chan any)
 	logChLock    = sync.Mutex{}
 )
 
 // Config http logger target
 type Config struct {
-	Enabled    bool              `json:"enabled"`
-	Name       string            `json:"name"`
-	UserAgent  string            `json:"userAgent"`
-	Endpoint   *xnet.URL         `json:"endpoint"`
-	AuthToken  string            `json:"authToken"`
-	ClientCert string            `json:"clientCert"`
-	ClientKey  string            `json:"clientKey"`
-	BatchSize  int               `json:"batchSize"`
-	QueueSize  int               `json:"queueSize"`
-	QueueDir   string            `json:"queueDir"`
-	MaxRetry   int               `json:"maxRetry"`
-	RetryIntvl time.Duration     `json:"retryInterval"`
-	Proxy      string            `json:"string"`
-	Transport  http.RoundTripper `json:"-"`
+	Enabled     bool              `json:"enabled"`
+	Name        string            `json:"name"`
+	UserAgent   string            `json:"userAgent"`
+	Endpoint    *xnet.URL         `json:"endpoint"`
+	AuthToken   string            `json:"authToken"`
+	ClientCert  string            `json:"clientCert"`
+	ClientKey   string            `json:"clientKey"`
+	BatchSize   int               `json:"batchSize"`
+	QueueSize   int               `json:"queueSize"`
+	QueueDir    string            `json:"queueDir"`
+	MaxRetry    int               `json:"maxRetry"`
+	RetryIntvl  time.Duration     `json:"retryInterval"`
+	Proxy       string            `json:"string"`
+	Transport   http.RoundTripper `json:"-"`
+	HTTPTimeout time.Duration     `json:"httpTimeout"`
 
 	// Custom logger
-	LogOnceIf func(ctx context.Context, err error, id string, errKind ...interface{}) `json:"-"`
+	LogOnceIf func(ctx context.Context, err error, id string, errKind ...any) `json:"-"`
 }
 
 // Target implements logger.Target and sends the json
@@ -110,7 +109,7 @@ type Target struct {
 	// Channel of log entries.
 	// Reading logCh must hold read lock on logChMu (to avoid read race)
 	// Sending a value on logCh must hold read lock on logChMu (to avoid closing)
-	logCh   chan interface{}
+	logCh   chan any
 	logChMu sync.RWMutex
 
 	// If this webhook is being re-configured we will
@@ -132,13 +131,14 @@ type Target struct {
 
 	// store to persist and replay the logs to the target
 	// to avoid missing events when the target is down.
-	store          store.Store[interface{}]
+	store          store.Store[any]
 	storeCtxCancel context.CancelFunc
 
 	initQueueOnce once.Init
 
-	config Config
-	client *http.Client
+	config      Config
+	client      *http.Client
+	httpTimeout time.Duration
 }
 
 // Name returns the name of the target
@@ -199,7 +199,7 @@ func (h *Target) initDiskStore(ctx context.Context) (err error) {
 	h.lastStarted = time.Now()
 	go h.startQueueProcessor(ctx, true)
 
-	queueStore := store.NewQueueStore[interface{}](
+	queueStore := store.NewQueueStore[any](
 		filepath.Join(h.config.QueueDir, h.Name()),
 		uint64(h.config.QueueSize),
 		httpLoggerExtension,
@@ -289,7 +289,7 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 	h.wg.Add(1)
 	defer h.wg.Done()
 
-	entries := make([]interface{}, 0)
+	entries := make([]any, 0)
 	name := h.Name()
 
 	defer func() {
@@ -353,9 +353,9 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 		if count < h.batchSize {
 			tickered := false
 			select {
-			case _ = <-ticker.C:
+			case <-ticker.C:
 				tickered = true
-			case entry, _ = <-globalBuffer:
+			case entry = <-globalBuffer:
 			case entry, ok = <-h.logCh:
 				if !ok {
 					return
@@ -429,7 +429,7 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 
 		var err error
 		if !isDirQueue {
-			err = h.send(ctx, buf.Bytes(), count, h.payloadType, webhookCallTimeout)
+			err = h.send(ctx, buf.Bytes(), count, h.payloadType, h.httpTimeout)
 		} else {
 			_, err = h.store.PutMultiple(entries)
 		}
@@ -455,7 +455,7 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 			}
 		}
 
-		entries = make([]interface{}, 0)
+		entries = make([]any, 0)
 		count = 0
 		if !isDirQueue {
 			buf.Reset()
@@ -466,7 +466,6 @@ func (h *Target) startQueueProcessor(ctx context.Context, mainWorker bool) {
 				return
 			}
 		}
-
 	}
 }
 
@@ -482,7 +481,7 @@ func CreateOrAdjustGlobalBuffer(currentTgt *Target, newTgt *Target) {
 
 	currentBuff, ok := logChBuffers[name]
 	if !ok {
-		logChBuffers[name] = make(chan interface{}, requiredCap)
+		logChBuffers[name] = make(chan any, requiredCap)
 		currentCap = requiredCap
 	} else {
 		currentCap = cap(currentBuff)
@@ -490,7 +489,7 @@ func CreateOrAdjustGlobalBuffer(currentTgt *Target, newTgt *Target) {
 	}
 
 	if requiredCap > currentCap {
-		logChBuffers[name] = make(chan interface{}, requiredCap)
+		logChBuffers[name] = make(chan any, requiredCap)
 
 		if len(currentBuff) > 0 {
 		drain:
@@ -520,10 +519,11 @@ func New(config Config) (*Target, error) {
 	}
 
 	h := &Target{
-		logCh:      make(chan interface{}, config.QueueSize),
-		config:     config,
-		batchSize:  config.BatchSize,
-		maxWorkers: int64(maxWorkers),
+		logCh:       make(chan any, config.QueueSize),
+		config:      config,
+		batchSize:   config.BatchSize,
+		maxWorkers:  int64(maxWorkers),
+		httpTimeout: config.HTTPTimeout,
 	}
 	h.status.Store(statusOffline)
 
@@ -537,9 +537,11 @@ func New(config Config) (*Target, error) {
 	if h.config.Proxy != "" {
 		proxyURL, _ := url.Parse(h.config.Proxy)
 		transport := h.config.Transport
-		ctransport := transport.(*http.Transport).Clone()
-		ctransport.Proxy = http.ProxyURL(proxyURL)
-		h.config.Transport = ctransport
+		if tr, ok := transport.(*http.Transport); ok {
+			ctransport := tr.Clone()
+			ctransport.Proxy = http.ProxyURL(proxyURL)
+			h.config.Transport = ctransport
+		}
 	}
 
 	h.client = &http.Client{Transport: h.config.Transport}
@@ -566,7 +568,7 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 		}
 	}
 
-	if err := h.send(context.Background(), eventData, count, h.payloadType, webhookCallTimeout); err != nil {
+	if err := h.send(context.Background(), eventData, count, h.payloadType, h.httpTimeout); err != nil {
 		return err
 	}
 
@@ -577,7 +579,7 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 // Send the log message 'entry' to the http target.
 // Messages are queued in the disk if the store is enabled
 // If Cancel has been called the message is ignored.
-func (h *Target) Send(ctx context.Context, entry interface{}) error {
+func (h *Target) Send(ctx context.Context, entry any) error {
 	if h.status.Load() == statusClosed {
 		if h.migrateTarget != nil {
 			return h.migrateTarget.Send(ctx, entry)

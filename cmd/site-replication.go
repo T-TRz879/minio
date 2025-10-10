@@ -26,10 +26,12 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
 	"net/url"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -37,7 +39,6 @@ import (
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
-	minioClient "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/replication"
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -241,11 +242,9 @@ func (c *SiteReplicationSys) Init(ctx context.Context, objAPI ObjectLayer) error
 		}
 		replLogOnceIf(context.Background(), fmt.Errorf("unable to initialize site replication subsystem: (%w)", err), "site-relication-init")
 
-		duration := time.Duration(r.Float64() * float64(time.Minute))
-		if duration < time.Second {
+		duration := max(time.Duration(r.Float64()*float64(time.Minute)),
 			// Make sure to sleep at least a second to avoid high CPU ticks.
-			duration = time.Second
-		}
+			time.Second)
 		time.Sleep(duration)
 	}
 	c.RLock()
@@ -391,7 +390,7 @@ func (c *SiteReplicationSys) getSiteStatuses(ctx context.Context, sites ...madmi
 			self:         info.DeploymentID == globalDeploymentID(),
 		})
 	}
-	return
+	return psi, err
 }
 
 // AddPeerClusters - add cluster sites for replication configuration.
@@ -478,8 +477,8 @@ func (c *SiteReplicationSys) AddPeerClusters(ctx context.Context, psites []madmi
 	var secretKey string
 	var svcCred auth.Credentials
 	sa, _, err := globalIAMSys.getServiceAccount(ctx, siteReplicatorSvcAcc)
-	switch {
-	case err == errNoSuchServiceAccount:
+	switch err {
+	case errNoSuchServiceAccount:
 		_, secretKey, err = auth.GenerateCredentials()
 		if err != nil {
 			return madmin.ReplicateAddStatus{}, errSRServiceAccount(fmt.Errorf("unable to create local service account: %w", err))
@@ -492,7 +491,7 @@ func (c *SiteReplicationSys) AddPeerClusters(ctx context.Context, psites []madmi
 		if err != nil {
 			return madmin.ReplicateAddStatus{}, errSRServiceAccount(fmt.Errorf("unable to create local service account: %w", err))
 		}
-	case err == nil:
+	case nil:
 		svcCred = sa.Credentials
 		secretKey = svcCred.SecretKey
 	default:
@@ -721,7 +720,6 @@ func (c *SiteReplicationSys) Netperf(ctx context.Context, duration time.Duration
 	var wg sync.WaitGroup
 	var resultsMu sync.RWMutex
 	for _, info := range infos.Sites {
-		info := info
 		// will call siteNetperf, means call others's adminAPISiteReplicationDevNull
 		if globalDeploymentID() == info.DeploymentID {
 			wg.Add(1)
@@ -738,7 +736,6 @@ func (c *SiteReplicationSys) Netperf(ctx context.Context, duration time.Duration
 				resultsMu.Lock()
 				results.NodeResults = append(results.NodeResults, result)
 				resultsMu.Unlock()
-				return
 			}()
 			continue
 		}
@@ -756,11 +753,10 @@ func (c *SiteReplicationSys) Netperf(ctx context.Context, duration time.Duration
 			resultsMu.Lock()
 			results.NodeResults = append(results.NodeResults, result)
 			resultsMu.Unlock()
-			return
 		}()
 	}
 	wg.Wait()
-	return
+	return results, err
 }
 
 // GetClusterInfo - returns site replication information.
@@ -1037,7 +1033,6 @@ func (c *SiteReplicationSys) PeerBucketConfigureReplHandler(ctx context.Context,
 			if _, err = globalBucketMetadataSys.Update(ctx, bucket, bucketTargetsFile, tgtBytes); err != nil {
 				return wrapSRErr(err)
 			}
-
 		}
 		// no replication rule for this peer or target ARN missing in bucket targets
 		if targetARN == "" {
@@ -1406,7 +1401,6 @@ func (c *SiteReplicationSys) PeerSvcAccChangeHandler(ctx context.Context, change
 		if err := globalIAMSys.DeleteServiceAccount(ctx, change.Delete.AccessKey, true); err != nil {
 			return wrapSRErr(err)
 		}
-
 	}
 
 	return nil
@@ -1430,8 +1424,8 @@ func (c *SiteReplicationSys) PeerPolicyMappingHandler(ctx context.Context, mappi
 	userType := IAMUserType(mapping.UserType)
 	isGroup := mapping.IsGroup
 	entityName := mapping.UserOrGroup
-	if globalIAMSys.GetUsersSysType() == LDAPUsersSysType && userType == stsUser {
 
+	if globalIAMSys.GetUsersSysType() == LDAPUsersSysType && userType == stsUser {
 		// Validate that the user or group exists in LDAP and use the normalized
 		// form of the entityName (which will be an LDAP DN).
 		var err error
@@ -1441,7 +1435,7 @@ func (c *SiteReplicationSys) PeerPolicyMappingHandler(ctx context.Context, mappi
 			if foundGroupDN, underBaseDN, err = globalIAMSys.LDAPConfig.GetValidatedGroupDN(nil, entityName); err != nil {
 				iamLogIf(ctx, err)
 			} else if foundGroupDN == nil || !underBaseDN {
-				err = errNoSuchGroup
+				return wrapSRErr(errNoSuchGroup)
 			}
 			entityName = foundGroupDN.NormDN
 		} else {
@@ -1449,7 +1443,7 @@ func (c *SiteReplicationSys) PeerPolicyMappingHandler(ctx context.Context, mappi
 			if foundUserDN, err = globalIAMSys.LDAPConfig.GetValidatedDNForUsername(entityName); err != nil {
 				iamLogIf(ctx, err)
 			} else if foundUserDN == nil {
-				err = errNoSuchUser
+				return wrapSRErr(errNoSuchUser)
 			}
 			entityName = foundUserDN.NormDN
 		}
@@ -2154,7 +2148,7 @@ func (c *SiteReplicationSys) syncToAllPeers(ctx context.Context, addOpts madmin.
 						SecretKey:     acc.Credentials.SecretKey,
 						Groups:        acc.Credentials.Groups,
 						Claims:        claims,
-						SessionPolicy: json.RawMessage(policyJSON),
+						SessionPolicy: policyJSON,
 						Status:        acc.Credentials.Status,
 						Name:          acc.Credentials.Name,
 						Description:   acc.Credentials.Description,
@@ -2596,17 +2590,17 @@ func (c *SiteReplicationSys) RemoveRemoteTargetsForEndpoint(ctx context.Context,
 		}
 		targets, terr := globalBucketTargetSys.ListBucketTargets(ctx, t.SourceBucket)
 		if terr != nil {
-			return err
+			return terr
 		}
 		tgtBytes, terr := json.Marshal(&targets)
 		if terr != nil {
-			return err
+			return terr
 		}
 		if _, err = globalBucketMetadataSys.Update(ctx, t.SourceBucket, bucketTargetsFile, tgtBytes); err != nil {
 			return err
 		}
 	}
-	return
+	return err
 }
 
 // Other helpers
@@ -2619,15 +2613,14 @@ func getAdminClient(endpoint, accessKey, secretKey string) (*madmin.AdminClient,
 	if globalBucketTargetSys.isOffline(epURL) {
 		return nil, RemoteTargetConnectionErr{Endpoint: epURL.String(), Err: fmt.Errorf("remote target is offline for endpoint %s", epURL.String())}
 	}
-	client, err := madmin.New(epURL.Host, accessKey, secretKey, epURL.Scheme == "https")
-	if err != nil {
-		return nil, err
-	}
-	client.SetCustomTransport(globalRemoteTargetTransport)
-	return client, nil
+	return madmin.NewWithOptions(epURL.Host, &madmin.Options{
+		Creds:     credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure:    epURL.Scheme == "https",
+		Transport: globalRemoteTargetTransport,
+	})
 }
 
-func getS3Client(pc madmin.PeerSite) (*minioClient.Client, error) {
+func getS3Client(pc madmin.PeerSite) (*minio.Client, error) {
 	ep, err := url.Parse(pc.Endpoint)
 	if err != nil {
 		return nil, err
@@ -2636,7 +2629,7 @@ func getS3Client(pc madmin.PeerSite) (*minioClient.Client, error) {
 		return nil, RemoteTargetConnectionErr{Endpoint: ep.String(), Err: fmt.Errorf("remote target is offline for endpoint %s", ep.String())}
 	}
 
-	return minioClient.New(ep.Host, &minioClient.Options{
+	return minio.New(ep.Host, &minio.Options{
 		Creds:     credentials.NewStaticV4(pc.AccessKey, pc.SecretKey, ""),
 		Secure:    ep.Scheme == "https",
 		Transport: globalRemoteTargetTransport,
@@ -2779,7 +2772,7 @@ func (c *SiteReplicationSys) SiteReplicationStatus(ctx context.Context, objAPI O
 		}
 	}
 
-	return
+	return info, err
 }
 
 const (
@@ -2837,9 +2830,7 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 
 	info.Enabled = true
 	info.Sites = make(map[string]madmin.PeerInfo, len(c.state.Peers))
-	for d, peer := range c.state.Peers {
-		info.Sites[d] = peer
-	}
+	maps.Copy(info.Sites, c.state.Peers)
 	info.UpdatedAt = c.state.UpdatedAt
 
 	var maxBuckets int
@@ -3062,7 +3053,6 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 					sum.ReplicatedGroupPolicyMappings++
 					info.StatsSummary[ps.DeploymentID] = sum
 				}
-
 			}
 		}
 
@@ -3109,7 +3099,7 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 			var policies []*policy.Policy
 			uPolicyCount := 0
 			for _, ps := range pslc {
-				plcy, err := policy.ParseConfig(bytes.NewReader([]byte(ps.SRIAMPolicy.Policy)))
+				plcy, err := policy.ParseConfig(bytes.NewReader([]byte(ps.Policy)))
 				if err != nil {
 					continue
 				}
@@ -3326,7 +3316,7 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 			uRuleCount := 0
 			for _, rl := range ilmExpRules {
 				var rule lifecycle.Rule
-				if err := xml.Unmarshal([]byte(rl.ILMExpiryRule.ILMRule), &rule); err != nil {
+				if err := xml.Unmarshal([]byte(rl.ILMRule), &rule); err != nil {
 					continue
 				}
 				rules = append(rules, &rule)
@@ -3382,7 +3372,7 @@ func (c *SiteReplicationSys) siteReplicationStatus(ctx context.Context, objAPI O
 	info.MaxGroups = len(groupDescStats)
 	info.MaxPolicies = len(policyStats)
 	info.MaxILMExpiryRules = len(ilmExpiryRuleStats)
-	return
+	return info, err
 }
 
 // isReplicated returns true if count of replicated matches the number of
@@ -3603,7 +3593,7 @@ func isILMExpRuleReplicated(cntReplicated, total int, rules []*lifecycle.Rule) b
 		if err != nil {
 			return false
 		}
-		if !(string(prevRData) == string(rData)) {
+		if string(prevRData) != string(rData) {
 			return false
 		}
 	}
@@ -3823,9 +3813,7 @@ func (c *SiteReplicationSys) SiteReplicationMetaInfo(ctx context.Context, objAPI
 				info.ILMExpiryRules[opts.EntityValue] = rule
 			}
 		} else {
-			for id, rule := range allRules {
-				info.ILMExpiryRules[id] = rule
-			}
+			maps.Copy(info.ILMExpiryRules, allRules)
 		}
 	}
 	if opts.PeerState {
@@ -3963,9 +3951,7 @@ func (c *SiteReplicationSys) SiteReplicationMetaInfo(ctx context.Context, objAPI
 					return info, errSRBackendIssue(errG)
 				}
 			}
-			for group, d := range groupDescMap {
-				info.GroupDescMap[group] = d
-			}
+			maps.Copy(info.GroupDescMap, groupDescMap)
 		}
 	}
 	// cache SR metadata info for IAM
@@ -4419,7 +4405,7 @@ func (c *SiteReplicationSys) healILMExpiryConfig(ctx context.Context, objAPI Obj
 		// If latest peers ILM expiry flags are equal to current peer, no need to heal
 		flagEqual := true
 		for id, peer := range latestPeers {
-			if !(ps.Peers[id].ReplicateILMExpiry == peer.ReplicateILMExpiry) {
+			if ps.Peers[id].ReplicateILMExpiry != peer.ReplicateILMExpiry {
 				flagEqual = false
 				break
 			}
@@ -5481,12 +5467,12 @@ func (c *SiteReplicationSys) healUsers(ctx context.Context, objAPI ObjectLayer, 
 	)
 	for dID, ss := range us {
 		if lastUpdate.IsZero() {
-			lastUpdate = ss.userInfo.UserInfo.UpdatedAt
+			lastUpdate = ss.userInfo.UpdatedAt
 			latestID = dID
 			latestUserStat = ss
 		}
-		if !ss.userInfo.UserInfo.UpdatedAt.IsZero() && ss.userInfo.UserInfo.UpdatedAt.After(lastUpdate) {
-			lastUpdate = ss.userInfo.UserInfo.UpdatedAt
+		if !ss.userInfo.UpdatedAt.IsZero() && ss.userInfo.UpdatedAt.After(lastUpdate) {
+			lastUpdate = ss.userInfo.UpdatedAt
 			latestID = dID
 			latestUserStat = ss
 		}
@@ -5552,7 +5538,7 @@ func (c *SiteReplicationSys) healUsers(ctx context.Context, objAPI ObjectLayer, 
 						SecretKey:     creds.SecretKey,
 						Groups:        creds.Groups,
 						Claims:        claims,
-						SessionPolicy: json.RawMessage(policyJSON),
+						SessionPolicy: policyJSON,
 						Status:        creds.Status,
 						Name:          creds.Name,
 						Description:   creds.Description,
@@ -5699,11 +5685,8 @@ func isGroupDescEqual(g1, g2 madmin.GroupDesc) bool {
 	}
 	for _, v1 := range g1.Members {
 		var found bool
-		for _, v2 := range g2.Members {
-			if v1 == v2 {
-				found = true
-				break
-			}
+		if slices.Contains(g2.Members, v1) {
+			found = true
 		}
 		if !found {
 			return false
@@ -5723,11 +5706,8 @@ func isUserInfoEqual(u1, u2 madmin.UserInfo) bool {
 	}
 	for _, v1 := range u1.MemberOf {
 		var found bool
-		for _, v2 := range u2.MemberOf {
-			if v1 == v2 {
-				found = true
-				break
-			}
+		if slices.Contains(u2.MemberOf, v1) {
+			found = true
 		}
 		if !found {
 			return false

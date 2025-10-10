@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -223,9 +224,6 @@ func (h *healingTracker) updateProgress(success, skipped bool, bytes uint64) {
 // update will update the tracker on the disk.
 // If the tracker has been deleted an error is returned.
 func (h *healingTracker) update(ctx context.Context) error {
-	if h.disk.Healing() == nil {
-		return fmt.Errorf("healingTracker: drive %q is not marked as healing", h.ID)
-	}
 	h.mu.Lock()
 	if h.ID == "" || h.PoolIndex < 0 || h.SetIndex < 0 || h.DiskIndex < 0 {
 		h.ID, _ = h.disk.GetDiskID()
@@ -272,12 +270,7 @@ func (h *healingTracker) delete(ctx context.Context) error {
 func (h *healingTracker) isHealed(bucket string) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for _, v := range h.HealedBuckets {
-		if v == bucket {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(h.HealedBuckets, bucket)
 }
 
 // resume will reset progress to the numbers at the start of the bucket.

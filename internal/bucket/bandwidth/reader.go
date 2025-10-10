@@ -52,7 +52,7 @@ func (r *MonitoredReader) Read(buf []byte) (n int, err error) {
 	}
 	if r.lastErr != nil {
 		err = r.lastErr
-		return
+		return n, err
 	}
 	b := r.throttle.Burst()  // maximum available tokens
 	need := len(buf)         // number of bytes requested by caller
@@ -64,7 +64,6 @@ func (r *MonitoredReader) Read(buf []byte) (n int, err error) {
 			r.opts.HeaderSize = 0
 			need = int(math.Min(float64(b-hdr), float64(need))) // use remaining tokens towards payload
 			tokens = need + hdr
-
 		} else { // part of header can be accommodated
 			r.opts.HeaderSize -= b - 1
 			need = 1 // to ensure we read at least one byte for every Read
@@ -82,15 +81,15 @@ func (r *MonitoredReader) Read(buf []byte) (n int, err error) {
 	}
 	err = r.throttle.WaitN(r.ctx, tokens)
 	if err != nil {
-		return
+		return n, err
 	}
 	n, err = r.r.Read(buf[:need])
 	if err != nil {
 		r.lastErr = err
-		return
+		return n, err
 	}
 	r.m.updateMeasurement(r.opts.BucketOptions, uint64(tokens))
-	return
+	return n, err
 }
 
 // NewMonitoredReader returns reference to a monitored reader that throttles reads to configured bandwidth for the

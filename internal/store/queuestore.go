@@ -151,12 +151,12 @@ func (store *QueueStore[I]) multiWrite(key Key, items []I) (err error) {
 	// Increment the item count.
 	store.entries[key.String()] = time.Now().UnixNano()
 
-	return
+	return err
 }
 
 // write - writes an item to the directory.
 func (store *QueueStore[I]) write(key Key, item I) error {
-	// Marshalls the item.
+	// Marshals the item.
 	eventData, err := json.Marshal(item)
 	if err != nil {
 		return err
@@ -235,73 +235,37 @@ func (store *QueueStore[I]) GetRaw(key Key) (raw []byte, err error) {
 
 	raw, err = os.ReadFile(filepath.Join(store.directory, key.String()))
 	if err != nil {
-		return
+		return raw, err
 	}
 
 	if len(raw) == 0 {
 		return raw, os.ErrNotExist
 	}
 
-	return
+	if key.Compress {
+		raw, err = s2.Decode(nil, raw)
+	}
+
+	return raw, err
 }
 
 // Get - gets an item from the store.
 func (store *QueueStore[I]) Get(key Key) (item I, err error) {
-	store.RLock()
-
-	defer func(store *QueueStore[I]) {
-		store.RUnlock()
-		if err != nil && !os.IsNotExist(err) {
-			// Upon error we remove the entry.
-			store.Del(key)
-		}
-	}(store)
-
-	var eventData []byte
-	eventData, err = os.ReadFile(filepath.Join(store.directory, key.String()))
+	items, err := store.GetMultiple(key)
 	if err != nil {
 		return item, err
 	}
-
-	if len(eventData) == 0 {
-		return item, os.ErrNotExist
-	}
-
-	if err = json.Unmarshal(eventData, &item); err != nil {
-		return item, err
-	}
-
-	return item, nil
+	return items[0], nil
 }
 
 // GetMultiple will read the multi payload file and fetch the items
 func (store *QueueStore[I]) GetMultiple(key Key) (items []I, err error) {
-	store.RLock()
-
-	defer func(store *QueueStore[I]) {
-		store.RUnlock()
-		if err != nil && !os.IsNotExist(err) {
-			// Upon error we remove the entry.
-			store.Del(key)
-		}
-	}(store)
-
-	raw, err := os.ReadFile(filepath.Join(store.directory, key.String()))
+	raw, err := store.GetRaw(key)
 	if err != nil {
-		return
+		return nil, err
 	}
 
-	var decoder *jsoniter.Decoder
-	if key.Compress {
-		decodedBytes, err := s2.Decode(nil, raw)
-		if err != nil {
-			return nil, err
-		}
-		decoder = jsoniter.ConfigCompatibleWithStandardLibrary.NewDecoder(bytes.NewReader(decodedBytes))
-	} else {
-		decoder = jsoniter.ConfigCompatibleWithStandardLibrary.NewDecoder(bytes.NewReader(raw))
-	}
-
+	decoder := jsoniter.ConfigCompatibleWithStandardLibrary.NewDecoder(bytes.NewReader(raw))
 	for decoder.More() {
 		var item I
 		if err := decoder.Decode(&item); err != nil {
@@ -310,7 +274,7 @@ func (store *QueueStore[I]) GetMultiple(key Key) (items []I, err error) {
 		items = append(items, item)
 	}
 
-	return
+	return items, err
 }
 
 // Del - Deletes an entry from the store.

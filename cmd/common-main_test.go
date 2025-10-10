@@ -43,9 +43,8 @@ func Test_readFromSecret(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run("", func(t *testing.T) {
-			tmpfile, err := os.CreateTemp("", "testfile")
+			tmpfile, err := os.CreateTemp(t.TempDir(), "testfile")
 			if err != nil {
 				t.Error(err)
 			}
@@ -155,9 +154,8 @@ MINIO_ROOT_PASSWORD=minio123`,
 		},
 	}
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run("", func(t *testing.T) {
-			tmpfile, err := os.CreateTemp("", "testfile")
+			tmpfile, err := os.CreateTemp(t.TempDir(), "testfile")
 			if err != nil {
 				t.Error(err)
 			}

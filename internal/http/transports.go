@@ -32,8 +32,11 @@ import (
 var tlsClientSessionCacheSize = 100
 
 const (
-	WriteBufferSize = 64 << 10 // WriteBufferSize 64KiB moving up from 4KiB default
-	ReadBufferSize  = 64 << 10 // ReadBufferSize 64KiB moving up from 4KiB default
+	// WriteBufferSize 64KiB moving up from 4KiB default
+	WriteBufferSize = 64 << 10
+
+	// ReadBufferSize 64KiB moving up from 4KiB default
+	ReadBufferSize = 64 << 10
 )
 
 // ConnSettings - contains connection settings.
@@ -178,5 +181,25 @@ func (s ConnSettings) NewRemoteTargetHTTPTransport(insecure bool) func() *http.T
 
 	return func() *http.Transport {
 		return tr
+	}
+}
+
+// uaTransport - User-Agent  transport
+type uaTransport struct {
+	ua string
+	rt http.RoundTripper
+}
+
+func (u *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req2 := req.Clone(req.Context())
+	req2.Header.Set("User-Agent", u.ua)
+	return u.rt.RoundTrip(req2)
+}
+
+// WithUserAgent wraps an existing transport with custom User-Agent
+func WithUserAgent(rt http.RoundTripper, getUA func() string) http.RoundTripper {
+	return &uaTransport{
+		ua: getUA(),
+		rt: rt,
 	}
 }

@@ -18,11 +18,15 @@
 package store
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	jsoniter "github.com/json-iterator/go"
+	"github.com/valyala/bytebufferpool"
 )
 
 type TestItem struct {
@@ -65,7 +69,7 @@ func TestQueueStorePut(t *testing.T) {
 		t.Fatal("Failed to create a queue store ", err)
 	}
 	// Put 100 items.
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if _, err := store.Put(testItem); err != nil {
 			t.Fatal("Failed to put to queue store ", err)
 		}
@@ -89,7 +93,7 @@ func TestQueueStoreGet(t *testing.T) {
 		t.Fatal("Failed to create a queue store ", err)
 	}
 	// Put 10 items
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		if _, err := store.Put(testItem); err != nil {
 			t.Fatal("Failed to put to queue store ", err)
 		}
@@ -123,7 +127,7 @@ func TestQueueStoreDel(t *testing.T) {
 		t.Fatal("Failed to create a queue store ", err)
 	}
 	// Put 20 items.
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		if _, err := store.Put(testItem); err != nil {
 			t.Fatal("Failed to put to queue store ", err)
 		}
@@ -159,7 +163,7 @@ func TestQueueStoreLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal("Failed to create a queue store ", err)
 	}
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if _, err := store.Put(testItem); err != nil {
 			t.Fatal("Failed to put to queue store ", err)
 		}
@@ -181,7 +185,7 @@ func TestQueueStoreListN(t *testing.T) {
 	if err != nil {
 		t.Fatal("Failed to create a queue store ", err)
 	}
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		if _, err := store.Put(testItem); err != nil {
 			t.Fatal("Failed to put to queue store ", err)
 		}
@@ -221,6 +225,72 @@ func TestQueueStoreListN(t *testing.T) {
 	}
 }
 
+func TestMultiplePutGetRaw(t *testing.T) {
+	defer func() {
+		if err := tearDownQueueStore(); err != nil {
+			t.Fatalf("Failed to tear down store; %v", err)
+		}
+	}()
+	store, err := setUpQueueStore(queueDir, 10)
+	if err != nil {
+		t.Fatalf("Failed to create a queue store; %v", err)
+	}
+	// TestItem{Name: "test-item", Property: "property"}
+	var items []TestItem
+	for i := range 10 {
+		items = append(items, TestItem{
+			Name:     fmt.Sprintf("test-item-%d", i),
+			Property: "property",
+		})
+	}
+
+	buf := bytebufferpool.Get()
+	defer bytebufferpool.Put(buf)
+
+	enc := jsoniter.ConfigCompatibleWithStandardLibrary.NewEncoder(buf)
+	for i := range items {
+		if err = enc.Encode(items[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := store.PutMultiple(items); err != nil {
+		t.Fatalf("failed to put multiple; %v", err)
+	}
+
+	keys := store.List()
+	if len(keys) != 1 {
+		t.Fatalf("expected len(keys)=1, but found %d", len(keys))
+	}
+
+	key := keys[0]
+	if !key.Compress {
+		t.Fatal("expected the item to be compressed")
+	}
+	if key.ItemCount != 10 {
+		t.Fatalf("expected itemcount=10 but found %v", key.ItemCount)
+	}
+
+	raw, err := store.GetRaw(key)
+	if err != nil {
+		t.Fatalf("unable to get multiple items; %v", err)
+	}
+
+	if !bytes.Equal(buf.Bytes(), raw) {
+		t.Fatalf("expected bytes: %d vs read bytes is wrong %d", len(buf.Bytes()), len(raw))
+	}
+
+	if err := store.Del(key); err != nil {
+		t.Fatalf("unable to Del; %v", err)
+	}
+
+	// Re-list
+	keys = store.List()
+	if len(keys) > 0 || err != nil {
+		t.Fatalf("Expected List() to return empty list and no error, got %v err: %v", keys, err)
+	}
+}
+
 func TestMultiplePutGets(t *testing.T) {
 	defer func() {
 		if err := tearDownQueueStore(); err != nil {
@@ -233,7 +303,7 @@ func TestMultiplePutGets(t *testing.T) {
 	}
 	// TestItem{Name: "test-item", Property: "property"}
 	var items []TestItem
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		items = append(items, TestItem{
 			Name:     fmt.Sprintf("test-item-%d", i),
 			Property: "property",
@@ -289,7 +359,7 @@ func TestMixedPutGets(t *testing.T) {
 	}
 	// TestItem{Name: "test-item", Property: "property"}
 	var items []TestItem
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		items = append(items, TestItem{
 			Name:     fmt.Sprintf("test-item-%d", i),
 			Property: "property",

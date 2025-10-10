@@ -20,6 +20,7 @@ package event
 import (
 	"context"
 	"fmt"
+	"maps"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -114,7 +115,6 @@ func (list *TargetList) incCurrentSendCalls(id TargetID) {
 
 	stats.currentSendCalls++
 	list.targetStats[id] = stats
-	return
 }
 
 func (list *TargetList) decCurrentSendCalls(id TargetID) {
@@ -129,7 +129,6 @@ func (list *TargetList) decCurrentSendCalls(id TargetID) {
 
 	stats.currentSendCalls--
 	list.targetStats[id] = stats
-	return
 }
 
 func (list *TargetList) incFailedEvents(id TargetID) {
@@ -143,7 +142,6 @@ func (list *TargetList) incFailedEvents(id TargetID) {
 
 	stats.failedEvents++
 	list.targetStats[id] = stats
-	return
 }
 
 func (list *TargetList) incTotalEvents(id TargetID) {
@@ -157,7 +155,6 @@ func (list *TargetList) incTotalEvents(id TargetID) {
 
 	stats.totalEvents++
 	list.targetStats[id] = stats
-	return
 }
 
 type asyncEvent struct {
@@ -256,9 +253,7 @@ func (list *TargetList) TargetMap() map[TargetID]Target {
 	defer list.RUnlock()
 
 	ntargets := make(map[TargetID]Target, len(list.targets))
-	for k, v := range list.targets {
-		ntargets[k] = v
-	}
+	maps.Copy(ntargets, list.targets)
 	return ntargets
 }
 
@@ -361,7 +356,7 @@ func (list *TargetList) startSendWorkers(workerCount int) {
 	if err != nil {
 		panic(err)
 	}
-	for i := 0; i < workerCount; i++ {
+	for range workerCount {
 		wk.Take()
 		go func() {
 			defer wk.Give()

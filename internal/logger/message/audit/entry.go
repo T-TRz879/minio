@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/pkg/v3/logger/message/audit"
+	"github.com/minio/madmin-go/v3/logger/audit"
 
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
@@ -41,7 +41,7 @@ func NewEntry(deploymentID string) audit.Entry {
 }
 
 // ToEntry - constructs an audit entry from a http request
-func ToEntry(w http.ResponseWriter, r *http.Request, reqClaims map[string]interface{}, deploymentID string) audit.Entry {
+func ToEntry(w http.ResponseWriter, r *http.Request, reqClaims map[string]any, deploymentID string) audit.Entry {
 	entry := NewEntry(deploymentID)
 
 	entry.RemoteHost = handlers.GetSourceIP(r)

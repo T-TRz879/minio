@@ -21,8 +21,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"syscall"
 	"time"
+
+	"github.com/minio/minio/internal/deadlineconn"
 )
 
 type acceptResult struct {
@@ -36,46 +39,39 @@ type httpListener struct {
 	opts        TCPOptions
 	listeners   []net.Listener    // underlying TCP listeners.
 	acceptCh    chan acceptResult // channel where all TCP listeners write accepted connection.
-	ctx         context.Context
+	ctxDoneCh   <-chan struct{}
 	ctxCanceler context.CancelFunc
 }
 
 // start - starts separate goroutine for each TCP listener.  A valid new connection is passed to httpListener.acceptCh.
 func (listener *httpListener) start() {
-	// Closure to send acceptResult to acceptCh.
-	// It returns true if the result is sent else false if returns when doneCh is closed.
-	send := func(result acceptResult) bool {
-		select {
-		case listener.acceptCh <- result:
-			// Successfully written to acceptCh
-			return true
-		case <-listener.ctx.Done():
-			return false
-		}
-	}
-
-	// Closure to handle TCPListener until done channel is closed.
-	handleListener := func(idx int, listener net.Listener) {
+	// Closure to handle listener until httpListener.ctxDoneCh channel is closed.
+	handleListener := func(idx int, ln net.Listener) {
 		for {
-			conn, err := listener.Accept()
-			send(acceptResult{conn, err, idx})
+			conn, err := ln.Accept()
+			select {
+			case listener.acceptCh <- acceptResult{conn, err, idx}:
+			case <-listener.ctxDoneCh:
+				return
+			}
 		}
 	}
 
-	// Start separate goroutine for each TCP listener to handle connection.
-	for idx, tcpListener := range listener.listeners {
-		go handleListener(idx, tcpListener)
+	// Start separate goroutine for each listener to handle connection.
+	for idx, ln := range listener.listeners {
+		go handleListener(idx, ln)
 	}
 }
 
 // Accept - reads from httpListener.acceptCh for one of previously accepted TCP connection and returns the same.
 func (listener *httpListener) Accept() (conn net.Conn, err error) {
 	select {
-	case result, ok := <-listener.acceptCh:
-		if ok {
-			return result.conn, result.err
+	case result := <-listener.acceptCh:
+		if result.err != nil {
+			return nil, result.err
 		}
-	case <-listener.ctx.Done():
+		return deadlineconn.New(result.conn).WithReadDeadline(listener.opts.IdleTimeout).WithWriteDeadline(listener.opts.IdleTimeout), result.err
+	case <-listener.ctxDoneCh:
 	}
 	return nil, syscall.EINVAL
 }
@@ -98,17 +94,19 @@ func (listener *httpListener) Addr() (addr net.Addr) {
 		return addr
 	}
 
-	tcpAddr := addr.(*net.TCPAddr)
-	if ip := net.ParseIP("0.0.0.0"); ip != nil {
-		tcpAddr.IP = ip
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+		return &net.TCPAddr{
+			IP:   net.IPv4zero,
+			Port: tcpAddr.Port,
+			Zone: tcpAddr.Zone,
+		}
 	}
-
-	addr = tcpAddr
-	return addr
+	panic("unknown address type on listener")
 }
 
 // Addrs - returns all address information of TCP listeners.
 func (listener *httpListener) Addrs() (addrs []net.Addr) {
+	addrs = make([]net.Addr, 0, len(listener.listeners))
 	for i := range listener.listeners {
 		addrs = append(addrs, listener.listeners[i].Addr())
 	}
@@ -128,6 +126,7 @@ type TCPOptions struct {
 	NoDelay     bool             // Indicates callers to enable TCP_NODELAY on the net.Conn
 	Interface   string           // This is a VRF device passed via `--interface` flag
 	Trace       func(msg string) // Trace when starting.
+	IdleTimeout time.Duration    // Incoming TCP read/write timeout
 }
 
 // ForWebsocket returns TCPOptions valid for websocket net.Conn
@@ -149,6 +148,10 @@ func newHTTPListener(ctx context.Context, serverAddrs []string, opts TCPOptions)
 	listeners := make([]net.Listener, 0, len(serverAddrs))
 	listenErrs = make([]error, len(serverAddrs))
 
+	if opts.Trace == nil {
+		opts.Trace = func(msg string) {} // Noop if not defined.
+	}
+
 	// Unix listener with special TCP options.
 	listenCfg := net.ListenConfig{
 		Control: setTCPParametersFn(opts),
@@ -157,36 +160,32 @@ func newHTTPListener(ctx context.Context, serverAddrs []string, opts TCPOptions)
 	for i, serverAddr := range serverAddrs {
 		l, e := listenCfg.Listen(ctx, "tcp", serverAddr)
 		if e != nil {
-			if opts.Trace != nil {
-				opts.Trace(fmt.Sprint("listenCfg.Listen: ", e))
-			}
+			opts.Trace("listenCfg.Listen: " + e.Error())
 
 			listenErrs[i] = e
 			continue
 		}
-
-		if opts.Trace != nil {
-			opts.Trace(fmt.Sprint("adding listener to ", l.Addr()))
-		}
+		opts.Trace("adding listener to " + l.Addr().String())
 
 		listeners = append(listeners, l)
 	}
 
 	if len(listeners) == 0 {
 		// No listeners initialized, no need to continue
-		return
+		return listener, listenErrs
 	}
+	listeners = slices.Clip(listeners)
 
+	ctx, cancel := context.WithCancel(ctx)
 	listener = &httpListener{
-		listeners: listeners,
-		acceptCh:  make(chan acceptResult, len(listeners)),
-		opts:      opts,
+		listeners:   listeners,
+		acceptCh:    make(chan acceptResult, len(listeners)),
+		opts:        opts,
+		ctxDoneCh:   ctx.Done(),
+		ctxCanceler: cancel,
 	}
-	listener.ctx, listener.ctxCanceler = context.WithCancel(ctx)
-	if opts.Trace != nil {
-		opts.Trace(fmt.Sprint("opening ", len(listener.listeners), " listeners"))
-	}
+	opts.Trace(fmt.Sprintf("opening %d listeners", len(listener.listeners)))
 	listener.start()
 
-	return
+	return listener, listenErrs
 }

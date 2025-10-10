@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/textproto"
 	"strings"
@@ -237,6 +238,25 @@ type Config struct {
 	} `xml:"Rule,omitempty"`
 }
 
+// String returns the human readable format of object lock configuration, used in audit logs.
+func (config Config) String() string {
+	parts := []string{
+		fmt.Sprintf("Enabled: %v", config.Enabled()),
+	}
+	if config.Rule != nil {
+		if config.Rule.DefaultRetention.Mode != "" {
+			parts = append(parts, fmt.Sprintf("Mode: %s", config.Rule.DefaultRetention.Mode))
+		}
+		if config.Rule.DefaultRetention.Days != nil {
+			parts = append(parts, fmt.Sprintf("Days: %d", *config.Rule.DefaultRetention.Days))
+		}
+		if config.Rule.DefaultRetention.Years != nil {
+			parts = append(parts, fmt.Sprintf("Years: %d", *config.Rule.DefaultRetention.Years))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
 // Enabled returns true if config.ObjectLockEnabled is set to Enabled
 func (config *Config) Enabled() bool {
 	return config.ObjectLockEnabled == Enabled
@@ -347,6 +367,10 @@ type ObjectRetention struct {
 	XMLName         xml.Name      `xml:"Retention"`
 	Mode            RetMode       `xml:"Mode,omitempty"`
 	RetainUntilDate RetentionDate `xml:"RetainUntilDate,omitempty"`
+}
+
+func (o ObjectRetention) String() string {
+	return fmt.Sprintf("Mode: %s, RetainUntilDate: %s", o.Mode, o.RetainUntilDate.Time)
 }
 
 // Maximum 4KiB size per object retention config.
@@ -563,7 +587,7 @@ func ParseObjectLegalHold(reader io.Reader) (hold *ObjectLegalHold, err error) {
 	if !hold.Status.Valid() {
 		return nil, ErrMalformedXML
 	}
-	return
+	return hold, err
 }
 
 // FilterObjectLockMetadata filters object lock metadata if s3:GetObjectRetention permission is denied or if isCopy flag set.
@@ -578,9 +602,7 @@ func FilterObjectLockMetadata(metadata map[string]string, filterRetention, filte
 		}
 		if !copied {
 			dst = make(map[string]string, len(metadata))
-			for k, v := range metadata {
-				dst[k] = v
-			}
+			maps.Copy(dst, metadata)
 			copied = true
 		}
 		delete(dst, key)

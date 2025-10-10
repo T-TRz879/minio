@@ -46,7 +46,7 @@ func parseSQLTimestamp(s string) (t time.Time, err error) {
 			break
 		}
 	}
-	return
+	return t, err
 }
 
 // FormatSQLTimestamp - returns the a string representation of the
@@ -175,7 +175,6 @@ func dateDiff(timePart string, ts1, ts2 time.Time) (*Value, error) {
 		seconds := duration / time.Second
 		return FromInt(int64(seconds)), nil
 	default:
-
 	}
 	return nil, errNotImplemented
 }

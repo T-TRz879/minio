@@ -22,7 +22,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,13 +45,15 @@ import (
 
 // OpenID keys and envs.
 const (
-	ClientID      = "client_id"
-	ClientSecret  = "client_secret"
-	ConfigURL     = "config_url"
-	ClaimName     = "claim_name"
-	ClaimUserinfo = "claim_userinfo"
-	RolePolicy    = "role_policy"
-	DisplayName   = "display_name"
+	ClientID          = "client_id"
+	ClientSecret      = "client_secret"
+	ConfigURL         = "config_url"
+	ClaimName         = "claim_name"
+	ClaimUserinfo     = "claim_userinfo"
+	RolePolicy        = "role_policy"
+	DisplayName       = "display_name"
+	UserReadableClaim = "user_readable_claim"
+	UserIDClaim       = "user_id_claim"
 
 	Scopes             = "scopes"
 	RedirectURI        = "redirect_uri"
@@ -130,6 +134,14 @@ var (
 			Key:   KeyCloakAdminURL,
 			Value: "",
 		},
+		config.KV{
+			Key:   UserReadableClaim,
+			Value: "",
+		},
+		config.KV{
+			Key:   UserIDClaim,
+			Value: "",
+		},
 	}
 )
 
@@ -176,15 +188,9 @@ func (r *Config) Clone() Config {
 		transport:          r.transport,
 		closeRespFn:        r.closeRespFn,
 	}
-	for k, v := range r.arnProviderCfgsMap {
-		cfg.arnProviderCfgsMap[k] = v
-	}
-	for k, v := range r.ProviderCfgs {
-		cfg.ProviderCfgs[k] = v
-	}
-	for k, v := range r.roleArnPolicyMap {
-		cfg.roleArnPolicyMap[k] = v
-	}
+	maps.Copy(cfg.arnProviderCfgsMap, r.arnProviderCfgsMap)
+	maps.Copy(cfg.ProviderCfgs, r.ProviderCfgs)
+	maps.Copy(cfg.roleArnPolicyMap, r.roleArnPolicyMap)
 	return cfg
 }
 
@@ -200,7 +206,7 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		ProviderCfgs:       map[string]*providerCfg{},
 		pubKeys: publicKeys{
 			RWMutex: &sync.RWMutex{},
-			pkMap:   map[string]interface{}{},
+			pkMap:   map[string]any{},
 		},
 		roleArnPolicyMap: map[arn.ARN]string{},
 		transport:        openIDClientTransport,
@@ -298,7 +304,7 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 
 		if scopeList := getCfgVal(Scopes); scopeList != "" {
 			var scopes []string
-			for _, scope := range strings.Split(scopeList, ",") {
+			for scope := range strings.SplitSeq(scopeList, ",") {
 				scope = strings.TrimSpace(scope)
 				if scope == "" {
 					return c, config.Errorf("empty scope value is not allowed '%s', please refer to our documentation", scopeList)
@@ -404,13 +410,7 @@ func (r *Config) GetConfigInfo(s config.Config, cfgName string) ([]madmin.IDPCfg
 		return nil, err
 	}
 
-	present := false
-	for _, cfg := range openIDConfigs {
-		if cfg == cfgName {
-			present = true
-			break
-		}
-	}
+	present := slices.Contains(openIDConfigs, cfgName)
 
 	if !present {
 		return nil, ErrProviderConfigNotFound
@@ -534,7 +534,6 @@ func (r *Config) GetSettings() madmin.OpenIDSettings {
 				HashedClientSecret:   hashedSecret,
 			}
 		}
-
 	}
 
 	return res
@@ -628,4 +627,26 @@ func GetDefaultExpiration(dsecs string) (time.Duration, error) {
 	}
 
 	return defaultExpiryDuration, nil
+}
+
+// GetUserReadableClaim returns the human readable claim name for the given
+// configuration name.
+func (r Config) GetUserReadableClaim(cfgName string) string {
+	pCfg, ok := r.ProviderCfgs[cfgName]
+	if ok {
+		return pCfg.UserReadableClaim
+	}
+	return ""
+}
+
+// GetUserIDClaim returns the user ID claim for the given configuration name, or "sub" if not set.
+func (r Config) GetUserIDClaim(cfgName string) string {
+	pCfg, ok := r.ProviderCfgs[cfgName]
+	if ok {
+		if pCfg.UserIDClaim != "" {
+			return pCfg.UserIDClaim
+		}
+		return "sub"
+	}
+	return "" // an incorrect config should be handled outside this function
 }

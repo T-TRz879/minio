@@ -37,15 +37,14 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/klauspost/compress/zstd"
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/madmin-go/v3/logger/log"
 	"github.com/minio/minio/internal/bucket/bandwidth"
-	b "github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/grid"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v3/logger/message/log"
 )
 
 // To abstract a node over network.
@@ -56,6 +55,7 @@ var (
 	aoBucketInfo           = grid.NewArrayOf[*BucketInfo](func() *BucketInfo { return &BucketInfo{} })
 	aoMetricsGroup         = grid.NewArrayOf[*MetricV2](func() *MetricV2 { return &MetricV2{} })
 	madminBgHealState      = grid.NewJSONPool[madmin.BgHealState]()
+	madminHealResultItem   = grid.NewJSONPool[madmin.HealResultItem]()
 	madminCPUs             = grid.NewJSONPool[madmin.CPUs]()
 	madminMemInfo          = grid.NewJSONPool[madmin.MemInfo]()
 	madminNetInfo          = grid.NewJSONPool[madmin.NetInfo]()
@@ -97,7 +97,7 @@ var (
 	getSysErrorsRPC                = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.SysErrors]](grid.HandlerGetSysErrors, grid.NewMSS, madminSysErrors.NewJSON)
 	getSysServicesRPC              = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.SysServices]](grid.HandlerGetSysServices, grid.NewMSS, madminSysServices.NewJSON)
 	headBucketRPC                  = grid.NewSingleHandler[*grid.MSS, *VolInfo](grid.HandlerHeadBucket, grid.NewMSS, func() *VolInfo { return &VolInfo{} })
-	healBucketRPC                  = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerHealBucket, grid.NewMSS, grid.NewNoPayload)
+	healBucketRPC                  = grid.NewSingleHandler[*grid.MSS, *grid.JSON[madmin.HealResultItem]](grid.HandlerHealBucket, grid.NewMSS, madminHealResultItem.NewJSON)
 	listBucketsRPC                 = grid.NewSingleHandler[*BucketOptions, *grid.Array[*BucketInfo]](grid.HandlerListBuckets, func() *BucketOptions { return &BucketOptions{} }, aoBucketInfo.New)
 	loadBucketMetadataRPC          = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadBucketMetadata, grid.NewMSS, grid.NewNoPayload).IgnoreNilConn()
 	loadGroupRPC                   = grid.NewSingleHandler[*grid.MSS, grid.NoPayload](grid.HandlerLoadGroup, grid.NewMSS, grid.NewNoPayload)
@@ -146,7 +146,7 @@ func (s *peerRESTServer) DeletePolicyHandler(mss *grid.MSS) (np grid.NoPayload, 
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return
+	return np, nerr
 }
 
 // LoadPolicyHandler - reloads a policy on the server.
@@ -165,7 +165,7 @@ func (s *peerRESTServer) LoadPolicyHandler(mss *grid.MSS) (np grid.NoPayload, ne
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return
+	return np, nerr
 }
 
 // LoadPolicyMappingHandler - reloads a policy mapping on the server.
@@ -189,7 +189,7 @@ func (s *peerRESTServer) LoadPolicyMappingHandler(mss *grid.MSS) (np grid.NoPayl
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return
+	return np, nerr
 }
 
 // DeleteServiceAccountHandler - deletes a service account on the server.
@@ -208,7 +208,7 @@ func (s *peerRESTServer) DeleteServiceAccountHandler(mss *grid.MSS) (np grid.NoP
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return
+	return np, nerr
 }
 
 // LoadServiceAccountHandler - reloads a service account on the server.
@@ -227,7 +227,7 @@ func (s *peerRESTServer) LoadServiceAccountHandler(mss *grid.MSS) (np grid.NoPay
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return
+	return np, nerr
 }
 
 // DeleteUserHandler - deletes a user on the server.
@@ -246,7 +246,7 @@ func (s *peerRESTServer) DeleteUserHandler(mss *grid.MSS) (np grid.NoPayload, ne
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return
+	return np, nerr
 }
 
 // LoadUserHandler - reloads a user on the server.
@@ -275,7 +275,7 @@ func (s *peerRESTServer) LoadUserHandler(mss *grid.MSS) (np grid.NoPayload, nerr
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return
+	return np, nerr
 }
 
 // LoadGroupHandler - reloads group along with members list.
@@ -295,7 +295,7 @@ func (s *peerRESTServer) LoadGroupHandler(mss *grid.MSS) (np grid.NoPayload, ner
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return
+	return np, nerr
 }
 
 // StartProfilingHandler - Issues the start profiling command.
@@ -479,7 +479,7 @@ func (s *peerRESTServer) DeleteBucketMetadataHandler(mss *grid.MSS) (np grid.NoP
 	if localMetacacheMgr != nil {
 		localMetacacheMgr.deleteBucketCache(bucketName)
 	}
-	return
+	return np, nerr
 }
 
 // GetAllBucketStatsHandler - fetches bucket replication stats for all buckets from this peer.
@@ -554,7 +554,7 @@ func (s *peerRESTServer) LoadBucketMetadataHandler(mss *grid.MSS) (np grid.NoPay
 		globalBucketTargetSys.UpdateAllTargets(bucketName, meta.bucketTargetConfig)
 	}
 
-	return
+	return np, nerr
 }
 
 func (s *peerRESTServer) GetMetacacheListingHandler(opts *listPathOptions) (*metacache, *grid.RemoteErr) {
@@ -636,7 +636,7 @@ func (s *peerRESTServer) VerifyBinaryHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	if lrTime.Sub(currentReleaseTime) <= 0 {
-		s.writeErrorResponse(w, fmt.Errorf("server is already running the latest version: %s", Version))
+		s.writeErrorResponse(w, fmt.Errorf("server is running the latest version: %s", Version))
 		return
 	}
 
@@ -885,7 +885,7 @@ func (s *peerRESTServer) ReloadSiteReplicationConfigHandler(mss *grid.MSS) (np g
 	}
 
 	peersLogIf(context.Background(), globalSiteReplicationSys.Init(context.Background(), objAPI))
-	return
+	return np, nerr
 }
 
 func (s *peerRESTServer) ReloadPoolMetaHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
@@ -896,14 +896,14 @@ func (s *peerRESTServer) ReloadPoolMetaHandler(mss *grid.MSS) (np grid.NoPayload
 
 	pools, ok := objAPI.(*erasureServerPools)
 	if !ok {
-		return
+		return np, nerr
 	}
 
 	if err := pools.ReloadPoolMeta(context.Background()); err != nil {
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return
+	return np, nerr
 }
 
 func (s *peerRESTServer) HandlerClearUploadID(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
@@ -914,7 +914,7 @@ func (s *peerRESTServer) HandlerClearUploadID(mss *grid.MSS) (np grid.NoPayload,
 
 	pools, ok := objAPI.(*erasureServerPools)
 	if !ok {
-		return
+		return np, nerr
 	}
 
 	// No need to return errors, this is not a highly strict operation.
@@ -923,7 +923,7 @@ func (s *peerRESTServer) HandlerClearUploadID(mss *grid.MSS) (np grid.NoPayload,
 		pools.ClearUploadID(uploadID)
 	}
 
-	return
+	return np, nerr
 }
 
 func (s *peerRESTServer) StopRebalanceHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
@@ -938,7 +938,7 @@ func (s *peerRESTServer) StopRebalanceHandler(mss *grid.MSS) (np grid.NoPayload,
 	}
 
 	pools.StopRebalance()
-	return
+	return np, nerr
 }
 
 func (s *peerRESTServer) LoadRebalanceMetaHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
@@ -965,7 +965,7 @@ func (s *peerRESTServer) LoadRebalanceMetaHandler(mss *grid.MSS) (np grid.NoPayl
 		go pools.StartRebalance()
 	}
 
-	return
+	return np, nerr
 }
 
 func (s *peerRESTServer) LoadTransitionTierConfigHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
@@ -981,7 +981,7 @@ func (s *peerRESTServer) LoadTransitionTierConfigHandler(mss *grid.MSS) (np grid
 		}
 	}()
 
-	return
+	return np, nerr
 }
 
 // ConsoleLogHandler sends console logs of this node back to peer rest client
@@ -1034,7 +1034,7 @@ func (s *peerRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
 // GetBandwidth gets the bandwidth for the buckets requested.
 func (s *peerRESTServer) GetBandwidth(params *grid.URLValues) (*bandwidth.BucketBandwidthReport, *grid.RemoteErr) {
 	buckets := params.Values().Get("buckets")
-	selectBuckets := b.SelectBuckets(buckets)
+	selectBuckets := bandwidth.SelectBuckets(buckets)
 	return globalBucketMonitor.GetReport(selectBuckets), nil
 }
 
@@ -1258,21 +1258,21 @@ func (s *peerRESTServer) NetSpeedTestHandler(w http.ResponseWriter, r *http.Requ
 	peersLogIf(r.Context(), gob.NewEncoder(w).Encode(result))
 }
 
-func (s *peerRESTServer) HealBucketHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
+func (s *peerRESTServer) HealBucketHandler(mss *grid.MSS) (np *grid.JSON[madmin.HealResultItem], nerr *grid.RemoteErr) {
 	bucket := mss.Get(peerS3Bucket)
 	if isMinioMetaBucket(bucket) {
 		return np, grid.NewRemoteErr(errInvalidArgument)
 	}
 
 	bucketDeleted := mss.Get(peerS3BucketDeleted) == "true"
-	_, err := healBucketLocal(context.Background(), bucket, madmin.HealOpts{
+	res, err := healBucketLocal(context.Background(), bucket, madmin.HealOpts{
 		Remove: bucketDeleted,
 	})
 	if err != nil {
 		return np, grid.NewRemoteErr(err)
 	}
 
-	return np, nil
+	return madminHealResultItem.NewJSONWith(&res), nil
 }
 
 func (s *peerRESTServer) ListBucketsHandler(opts *BucketOptions) (*grid.Array[*BucketInfo], *grid.RemoteErr) {
@@ -1307,6 +1307,7 @@ func (s *peerRESTServer) HeadBucketHandler(mss *grid.MSS) (info *VolInfo, nerr *
 	return &VolInfo{
 		Name:    bucketInfo.Name,
 		Created: bucketInfo.Created,
+		Deleted: bucketInfo.Deleted, // needed for site replication
 	}, nil
 }
 
@@ -1412,6 +1413,7 @@ func registerPeerRESTHandlers(router *mux.Router, gm *grid.Manager) {
 	logger.FatalIf(signalServiceRPC.Register(gm, server.SignalServiceHandler), "unable to register handler")
 	logger.FatalIf(stopRebalanceRPC.Register(gm, server.StopRebalanceHandler), "unable to register handler")
 	logger.FatalIf(updateMetacacheListingRPC.Register(gm, server.UpdateMetacacheListingHandler), "unable to register handler")
+	logger.FatalIf(cleanupUploadIDCacheMetaRPC.Register(gm, server.HandlerClearUploadID), "unable to register handler")
 
 	logger.FatalIf(gm.RegisterStreamingHandler(grid.HandlerTrace, grid.StreamHandler{
 		Handle:      server.TraceHandler,

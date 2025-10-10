@@ -18,7 +18,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"slices"
 	"strconv"
@@ -146,7 +145,7 @@ func TestObjectToPartOffset(t *testing.T) {
 
 	// Test them.
 	for _, testCase := range testCases {
-		index, offset, err := fi.ObjectToPartOffset(context.Background(), testCase.offset)
+		index, offset, err := fi.ObjectToPartOffset(t.Context(), testCase.offset)
 		if err != testCase.expectedErr {
 			t.Fatalf("%+v: expected = %s, got: %s", testCase, testCase.expectedErr, err)
 		}
@@ -190,7 +189,7 @@ func TestFindFileInfoInQuorum(t *testing.T) {
 	commonNumVersions := 2
 	numVersionsInQuorum := make([]int, 16)
 	numVersionsNoQuorum := make([]int, 16)
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		if i < 4 {
 			continue
 		}
@@ -270,9 +269,8 @@ func TestFindFileInfoInQuorum(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run("", func(t *testing.T) {
-			fi, err := findFileInfoInQuorum(context.Background(), test.fis, test.modTime, "", test.expectedQuorum)
+			fi, err := findFileInfoInQuorum(t.Context(), test.fis, test.modTime, "", test.expectedQuorum)
 			_, ok1 := err.(InsufficientReadQuorum)
 			_, ok2 := test.expectedErr.(InsufficientReadQuorum)
 			if ok1 != ok2 {
@@ -317,7 +315,7 @@ func TestTransitionInfoEquals(t *testing.T) {
 	}
 
 	var i uint
-	for i = 0; i < 8; i++ {
+	for i = range uint(8) {
 		fi := FileInfo{
 			TransitionTier:      inputs[0].tier,
 			TransitionedObjName: inputs[0].remoteObjName,

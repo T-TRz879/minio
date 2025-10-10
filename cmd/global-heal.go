@@ -352,10 +352,6 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			disks[i], disks[j] = disks[j], disks[i]
 		})
 
-		expectedDisks := len(disks)/2 + 1
-		fallbackDisks := disks[expectedDisks:]
-		disks = disks[:expectedDisks]
-
 		filterLifecycle := func(bucket, object string, fi FileInfo) bool {
 			if lc == nil {
 				return false
@@ -459,8 +455,6 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 					continue
 				}
 
-				var versionHealed bool
-
 				res, err := er.HealObject(ctx, bucket, encodedEntryName,
 					version.VersionID, madmin.HealOpts{
 						ScanMode: scanMode,
@@ -475,21 +469,23 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 					}
 				} else {
 					// Look for the healing results
-					if res.After.Drives[tracker.DiskIndex].State == madmin.DriveStateOk {
-						versionHealed = true
+					if res.After.Drives[tracker.DiskIndex].State != madmin.DriveStateOk {
+						err = fmt.Errorf("unexpected after heal state: %s", res.After.Drives[tracker.DiskIndex].State)
 					}
 				}
 
-				if versionHealed {
+				if err == nil {
 					bgSeq.countHealed(madmin.HealItemObject)
 					result = healEntrySuccess(uint64(version.Size))
 				} else {
 					bgSeq.countFailed(madmin.HealItemObject)
 					result = healEntryFailure(uint64(version.Size))
 					if version.VersionID != "" {
-						healingLogIf(ctx, fmt.Errorf("unable to heal object %s/%s-v(%s): %w", bucket, version.Name, version.VersionID, err))
+						healingLogIf(ctx, fmt.Errorf("unable to heal object %s/%s (version-id=%s): %w",
+							bucket, version.Name, version.VersionID, err))
 					} else {
-						healingLogIf(ctx, fmt.Errorf("unable to heal object %s/%s: %w", bucket, version.Name, err))
+						healingLogIf(ctx, fmt.Errorf("unable to heal object %s/%s: %w",
+							bucket, version.Name, err))
 					}
 				}
 
@@ -518,7 +514,6 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 
 		err = listPathRaw(ctx, listPathRawOptions{
 			disks:          disks,
-			fallbackDisks:  fallbackDisks,
 			bucket:         bucket,
 			recursive:      true,
 			forwardTo:      forwardTo,
@@ -539,7 +534,8 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 				go healEntry(bucket, *entry)
 			},
 			finished: func(errs []error) {
-				if countErrs(errs, nil) != len(errs) {
+				success := countErrs(errs, nil)
+				if success < len(disks)/2+1 {
 					retErr = fmt.Errorf("one or more errors reported during listing: %v", errors.Join(errs...))
 				}
 			},

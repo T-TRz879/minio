@@ -226,10 +226,7 @@ func prepareErasure(ctx context.Context, nDisks int) (ObjectLayer, []string, err
 		for _, sets := range pool.erasureDisks {
 			for _, s := range sets {
 				if !s.IsLocal() {
-					for {
-						if s.IsOnline() {
-							break
-						}
+					for !s.IsOnline() {
 						time.Sleep(100 * time.Millisecond)
 						if time.Since(t) > 10*time.Second {
 							return nil, nil, errors.New("timeout waiting for disk to come online")
@@ -305,7 +302,7 @@ func nextSuffix() string {
 }
 
 // isSameType - compares two object types via reflect.TypeOf
-func isSameType(obj1, obj2 interface{}) bool {
+func isSameType(obj1, obj2 any) bool {
 	return reflect.TypeOf(obj1) == reflect.TypeOf(obj2)
 }
 
@@ -545,8 +542,8 @@ func truncateChunkByHalfSigv4(req *http.Request) (*http.Request, error) {
 		return nil, err
 	}
 
-	newChunkHdr := []byte(fmt.Sprintf("%s"+s3ChunkSignatureStr+"%s\r\n",
-		hexChunkSize, chunkSignature))
+	newChunkHdr := fmt.Appendf(nil, "%s"+s3ChunkSignatureStr+"%s\r\n",
+		hexChunkSize, chunkSignature)
 	newChunk, err := io.ReadAll(bufReader)
 	if err != nil {
 		return nil, err
@@ -567,8 +564,8 @@ func malformDataSigV4(req *http.Request, newByte byte) (*http.Request, error) {
 		return nil, err
 	}
 
-	newChunkHdr := []byte(fmt.Sprintf("%s"+s3ChunkSignatureStr+"%s\r\n",
-		hexChunkSize, chunkSignature))
+	newChunkHdr := fmt.Appendf(nil, "%s"+s3ChunkSignatureStr+"%s\r\n",
+		hexChunkSize, chunkSignature)
 	newChunk, err := io.ReadAll(bufReader)
 	if err != nil {
 		return nil, err
@@ -593,9 +590,9 @@ func malformChunkSizeSigV4(req *http.Request, badSize int64) (*http.Request, err
 	}
 
 	n := badSize
-	newHexChunkSize := []byte(fmt.Sprintf("%x", n))
-	newChunkHdr := []byte(fmt.Sprintf("%s"+s3ChunkSignatureStr+"%s\r\n",
-		newHexChunkSize, chunkSignature))
+	newHexChunkSize := fmt.Appendf(nil, "%x", n)
+	newChunkHdr := fmt.Appendf(nil, "%s"+s3ChunkSignatureStr+"%s\r\n",
+		newHexChunkSize, chunkSignature)
 	newChunk, err := io.ReadAll(bufReader)
 	if err != nil {
 		return nil, err
@@ -642,8 +639,8 @@ func signStreamingRequest(req *http.Request, accessKey, secretKey string, currTi
 	for _, k := range headers {
 		buf.WriteString(k)
 		buf.WriteByte(':')
-		switch {
-		case k == "host":
+		switch k {
+		case "host":
 			buf.WriteString(req.URL.Host)
 			fallthrough
 		default:
@@ -794,7 +791,6 @@ func assembleStreamingChunks(req *http.Request, body io.ReadSeeker, chunkSize in
 		if n <= 0 {
 			break
 		}
-
 	}
 	req.Body = io.NopCloser(bytes.NewReader(stream))
 	return req, nil
@@ -997,8 +993,8 @@ func signRequestV4(req *http.Request, accessKey, secretKey string) error {
 	for _, k := range headers {
 		buf.WriteString(k)
 		buf.WriteByte(':')
-		switch {
-		case k == "host":
+		switch k {
+		case "host":
 			buf.WriteString(req.URL.Host)
 			fallthrough
 		default:
@@ -1090,8 +1086,8 @@ func newTestRequest(method, urlStr string, contentLength int64, body io.ReadSeek
 	// Save for subsequent use
 	var hashedPayload string
 	var md5Base64 string
-	switch {
-	case body == nil:
+	switch body {
+	case nil:
 		hashedPayload = getSHA256Hash([]byte{})
 	default:
 		payloadBytes, err := io.ReadAll(body)
@@ -1497,7 +1493,7 @@ func getListenNotificationURL(endPoint, bucketName string, prefixes, suffixes, e
 // getRandomDisks - Creates a slice of N random disks, each of the form - minio-XXX
 func getRandomDisks(n int) ([]string, error) {
 	var erasureDisks []string
-	for i := 0; i < n; i++ {
+	for range n {
 		path, err := os.MkdirTemp(globalTestTmpDir, "minio-")
 		if err != nil {
 			// Remove directories created so far.
@@ -1638,7 +1634,7 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 		t.Fatal(failTestStr(anonTestStr, fmt.Sprintf("Object API Nil Test expected to fail with %d, but failed with %d", accessDenied, rec.Code)))
 	}
 
-	// HEAD HTTTP request doesn't contain response body.
+	// HEAD HTTP request doesn't contain response body.
 	if anonReq.Method != http.MethodHead {
 		// read the response body.
 		var actualContent []byte
@@ -1936,7 +1932,7 @@ func ExecObjectLayerTestWithDirs(t TestErrHandler, objTest objTestTypeWithDirs) 
 // ExecObjectLayerDiskAlteredTest - executes object layer tests while altering
 // disks in between tests. Creates Erasure ObjectLayer instance and runs test for Erasure layer.
 func ExecObjectLayerDiskAlteredTest(t *testing.T, objTest objTestDiskNotFoundType) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	objLayer, fsDirs, err := prepareErasure16(ctx)
@@ -1960,7 +1956,7 @@ type objTestStaleFilesType func(obj ObjectLayer, instanceType string, dirs []str
 // ExecObjectLayerStaleFilesTest - executes object layer tests those leaves stale
 // files/directories under .minio/tmp.  Creates Erasure ObjectLayer instance and runs test for Erasure layer.
 func ExecObjectLayerStaleFilesTest(t *testing.T, objTest objTestStaleFilesType) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	nDisks := 16
@@ -2123,7 +2119,7 @@ func generateTLSCertKey(host string) ([]byte, []byte, error) {
 		return nil, nil, fmt.Errorf("Missing host parameter")
 	}
 
-	publicKey := func(priv interface{}) interface{} {
+	publicKey := func(priv any) any {
 		switch k := priv.(type) {
 		case *rsa.PrivateKey:
 			return &k.PublicKey
@@ -2134,7 +2130,7 @@ func generateTLSCertKey(host string) ([]byte, []byte, error) {
 		}
 	}
 
-	pemBlockForKey := func(priv interface{}) *pem.Block {
+	pemBlockForKey := func(priv any) *pem.Block {
 		switch k := priv.(type) {
 		case *rsa.PrivateKey:
 			return &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}
@@ -2150,7 +2146,7 @@ func generateTLSCertKey(host string) ([]byte, []byte, error) {
 		}
 	}
 
-	var priv interface{}
+	var priv any
 	var err error
 	priv, err = rsa.GenerateKey(crand.Reader, rsaBits)
 	if err != nil {
@@ -2179,8 +2175,8 @@ func generateTLSCertKey(host string) ([]byte, []byte, error) {
 		BasicConstraintsValid: true,
 	}
 
-	hosts := strings.Split(host, ",")
-	for _, h := range hosts {
+	hosts := strings.SplitSeq(host, ",")
+	for h := range hosts {
 		if ip := net.ParseIP(h); ip != nil {
 			template.IPAddresses = append(template.IPAddresses, ip)
 		} else {
@@ -2247,12 +2243,12 @@ func getEndpointsLocalAddr(endpointServerPools EndpointServerPools) string {
 }
 
 // fetches a random number between range min-max.
-func getRandomRange(min, max int, seed int64) int {
+func getRandomRange(minN, maxN int, seed int64) int {
 	// special value -1 means no explicit seeding.
-	if seed != -1 {
-		rand.Seed(seed)
+	if seed == -1 {
+		return rand.New(rand.NewSource(time.Now().UnixNano())).Intn(maxN-minN) + minN
 	}
-	return rand.Intn(max-min) + min
+	return rand.New(rand.NewSource(seed)).Intn(maxN-minN) + minN
 }
 
 // Randomizes the order of bytes in the byte array
@@ -2278,7 +2274,7 @@ func TestToErrIsNil(t *testing.T) {
 	if toStorageErr(nil) != nil {
 		t.Errorf("Test expected to return nil, failed instead got a non-nil value %s", toStorageErr(nil))
 	}
-	ctx := context.Background()
+	ctx := t.Context()
 	if toAPIError(ctx, nil) != noError {
 		t.Errorf("Test expected error code to be ErrNone, failed instead provided %s", toAPIError(ctx, nil).Code)
 	}
@@ -2394,7 +2390,7 @@ func unzipArchive(zipFilePath, targetDir string) error {
 	if err != nil {
 		return err
 	}
-	for _, file := range zipReader.Reader.File {
+	for _, file := range zipReader.File {
 		zippedFile, err := file.Open()
 		if err != nil {
 			return err

@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -125,16 +126,16 @@ func (ri replicatedInfos) VersionPurgeStatus() VersionPurgeStatusType {
 	completed := 0
 	for _, v := range ri.Targets {
 		switch v.VersionPurgeStatus {
-		case Failed:
-			return Failed
-		case Complete:
+		case replication.VersionPurgeFailed:
+			return replication.VersionPurgeFailed
+		case replication.VersionPurgeComplete:
 			completed++
 		}
 	}
 	if completed == len(ri.Targets) {
-		return Complete
+		return replication.VersionPurgeComplete
 	}
-	return Pending
+	return replication.VersionPurgePending
 }
 
 func (ri replicatedInfos) VersionPurgeStatusInternal() string {
@@ -171,13 +172,13 @@ func (ri ReplicateObjectInfo) TargetReplicationStatus(arn string) (status replic
 	repStatMatches := replStatusRegex.FindAllStringSubmatch(ri.ReplicationStatusInternal, -1)
 	for _, repStatMatch := range repStatMatches {
 		if len(repStatMatch) != 3 {
-			return
+			return status
 		}
 		if repStatMatch[1] == arn {
 			return replication.StatusType(repStatMatch[2])
 		}
 	}
-	return
+	return status
 }
 
 // TargetReplicationStatus - returns replication status of a target
@@ -185,13 +186,13 @@ func (o ObjectInfo) TargetReplicationStatus(arn string) (status replication.Stat
 	repStatMatches := replStatusRegex.FindAllStringSubmatch(o.ReplicationStatusInternal, -1)
 	for _, repStatMatch := range repStatMatches {
 		if len(repStatMatch) != 3 {
-			return
+			return status
 		}
 		if repStatMatch[1] == arn {
 			return replication.StatusType(repStatMatch[2])
 		}
 	}
-	return
+	return status
 }
 
 type replicateTargetDecision struct {
@@ -309,9 +310,9 @@ func parseReplicateDecision(ctx context.Context, bucket, s string) (r ReplicateD
 		targetsMap: make(map[string]replicateTargetDecision),
 	}
 	if len(s) == 0 {
-		return
+		return r, err
 	}
-	for _, p := range strings.Split(s, ",") {
+	for p := range strings.SplitSeq(s, ",") {
 		if p == "" {
 			continue
 		}
@@ -326,7 +327,7 @@ func parseReplicateDecision(ctx context.Context, bucket, s string) (r ReplicateD
 		}
 		r.targetsMap[slc[0]] = replicateTargetDecision{Replicate: tgt[0] == "true", Synchronous: tgt[1] == "true", Arn: tgt[2], ID: tgt[3]}
 	}
-	return
+	return r, err
 }
 
 // ReplicationState represents internal replication state
@@ -373,14 +374,14 @@ func (rs *ReplicationState) CompositeReplicationStatus() (st replication.StatusT
 	case !rs.ReplicaStatus.Empty():
 		return rs.ReplicaStatus
 	default:
-		return
+		return st
 	}
 }
 
 // CompositeVersionPurgeStatus returns overall replication purge status for the permanent delete being replicated.
 func (rs *ReplicationState) CompositeVersionPurgeStatus() VersionPurgeStatusType {
 	switch VersionPurgeStatusType(rs.VersionPurgeStatusInternal) {
-	case Pending, Complete, Failed: // for backward compatibility
+	case replication.VersionPurgePending, replication.VersionPurgeComplete, replication.VersionPurgeFailed: // for backward compatibility
 		return VersionPurgeStatusType(rs.VersionPurgeStatusInternal)
 	default:
 		return getCompositeVersionPurgeStatus(rs.PurgeTargets)
@@ -478,16 +479,16 @@ func getCompositeVersionPurgeStatus(m map[string]VersionPurgeStatusType) Version
 	completed := 0
 	for _, v := range m {
 		switch v {
-		case Failed:
-			return Failed
-		case Complete:
+		case replication.VersionPurgeFailed:
+			return replication.VersionPurgeFailed
+		case replication.VersionPurgeComplete:
 			completed++
 		}
 	}
 	if completed == len(m) {
-		return Complete
+		return replication.VersionPurgeComplete
 	}
-	return Pending
+	return replication.VersionPurgePending
 }
 
 // getHealReplicateObjectInfo returns info needed by heal replication in ReplicateObjectInfo
@@ -635,28 +636,7 @@ type ResyncTarget struct {
 }
 
 // VersionPurgeStatusType represents status of a versioned delete or permanent delete w.r.t bucket replication
-type VersionPurgeStatusType string
-
-const (
-	// Pending - versioned delete replication is pending.
-	Pending VersionPurgeStatusType = "PENDING"
-
-	// Complete - versioned delete replication is now complete, erase version on disk.
-	Complete VersionPurgeStatusType = "COMPLETE"
-
-	// Failed - versioned delete replication failed.
-	Failed VersionPurgeStatusType = "FAILED"
-)
-
-// Empty returns true if purge status was not set.
-func (v VersionPurgeStatusType) Empty() bool {
-	return string(v) == ""
-}
-
-// Pending returns true if the version is pending purge.
-func (v VersionPurgeStatusType) Pending() bool {
-	return v == Pending || v == Failed
-}
+type VersionPurgeStatusType = replication.VersionPurgeStatusType
 
 type replicationResyncer struct {
 	// map of bucket to their resync status
@@ -756,10 +736,8 @@ type BucketReplicationResyncStatus struct {
 
 func (rs *BucketReplicationResyncStatus) cloneTgtStats() (m map[string]TargetReplicationResyncStatus) {
 	m = make(map[string]TargetReplicationResyncStatus)
-	for arn, st := range rs.TargetsMap {
-		m[arn] = st
-	}
-	return
+	maps.Copy(m, rs.TargetsMap)
+	return m
 }
 
 func newBucketResyncStatus(bucket string) BucketReplicationResyncStatus {
@@ -796,7 +774,7 @@ func extractReplicateDiffOpts(q url.Values) (opts madmin.ReplDiffOpts) {
 	opts.Verbose = q.Get("verbose") == "true"
 	opts.ARN = q.Get("arn")
 	opts.Prefix = q.Get("prefix")
-	return
+	return opts
 }
 
 const (

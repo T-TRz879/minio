@@ -39,6 +39,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v3/console"
 	"github.com/minio/pkg/v3/sync/errgroup"
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
 // setsDsyncLockers is encapsulated type for Close()
@@ -86,13 +87,15 @@ type erasureSets struct {
 	lastConnectDisksOpTime time.Time
 }
 
+var staleUploadsCleanupIntervalChangedCh = make(chan struct{})
+
 func (s *erasureSets) getDiskMap() map[Endpoint]StorageAPI {
 	diskMap := make(map[Endpoint]StorageAPI)
 
 	s.erasureDisksMu.RLock()
 	defer s.erasureDisksMu.RUnlock()
 
-	for i := 0; i < s.setCount; i++ {
+	for i := range s.setCount {
 		for j := 0; j < s.setDriveCount; j++ {
 			disk := s.erasureDisks[i][j]
 			if disk == OfflineDisk {
@@ -147,7 +150,7 @@ func findDiskIndexByDiskID(refFormat *formatErasureV3, diskID string) (int, int,
 	if diskID == offlineDiskUUID {
 		return -1, -1, fmt.Errorf("DriveID: %s is offline", diskID)
 	}
-	for i := 0; i < len(refFormat.Erasure.Sets); i++ {
+	for i := range len(refFormat.Erasure.Sets) {
 		for j := 0; j < len(refFormat.Erasure.Sets[0]); j++ {
 			if refFormat.Erasure.Sets[i][j] == diskID {
 				return i, j, nil
@@ -171,7 +174,7 @@ func findDiskIndex(refFormat, format *formatErasureV3) (int, int, error) {
 		return -1, -1, fmt.Errorf("DriveID: %s is offline", format.Erasure.This)
 	}
 
-	for i := 0; i < len(refFormat.Erasure.Sets); i++ {
+	for i := range len(refFormat.Erasure.Sets) {
 		for j := 0; j < len(refFormat.Erasure.Sets[0]); j++ {
 			if refFormat.Erasure.Sets[i][j] == format.Erasure.This {
 				return i, j, nil
@@ -374,7 +377,7 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 
 	mutex := newNSLock(globalIsDistErasure)
 
-	for i := 0; i < setCount; i++ {
+	for i := range setCount {
 		s.erasureDisks[i] = make([]StorageAPI, setDriveCount)
 	}
 
@@ -387,9 +390,9 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 
 	var wg sync.WaitGroup
 	var lk sync.Mutex
-	for i := 0; i < setCount; i++ {
+	for i := range setCount {
 		lockerEpSet := set.NewStringSet()
-		for j := 0; j < setDriveCount; j++ {
+		for j := range setDriveCount {
 			wg.Add(1)
 			go func(i int, endpoint Endpoint) {
 				defer wg.Done()
@@ -406,13 +409,13 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 	}
 	wg.Wait()
 
-	for i := 0; i < setCount; i++ {
+	for i := range setCount {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 
 			var innerWg sync.WaitGroup
-			for j := 0; j < setDriveCount; j++ {
+			for j := range setDriveCount {
 				disk := storageDisks[i*setDriveCount+j]
 				if disk == nil {
 					continue
@@ -532,10 +535,11 @@ func (s *erasureSets) cleanupStaleUploads(ctx context.Context) {
 				}(set)
 			}
 			wg.Wait()
-
-			// Reset for the next interval
-			timer.Reset(globalAPIConfig.getStaleUploadsCleanupInterval())
+		case <-staleUploadsCleanupIntervalChangedCh:
 		}
+
+		// Reset for the next interval
+		timer.Reset(globalAPIConfig.getStaleUploadsCleanupInterval())
 	}
 }
 
@@ -567,10 +571,7 @@ func auditObjectErasureSet(ctx context.Context, api, object string, set *erasure
 
 // NewNSLock - initialize a new namespace RWLocker instance.
 func (s *erasureSets) NewNSLock(bucket string, objects ...string) RWLocker {
-	if len(objects) == 1 {
-		return s.getHashedSet(objects[0]).NewNSLock(bucket, objects...)
-	}
-	return s.getHashedSet("").NewNSLock(bucket, objects...)
+	return s.sets[0].NewNSLock(bucket, objects...)
 }
 
 // SetDriveCount returns the current drives per set.
@@ -592,7 +593,6 @@ func (s *erasureSets) StorageInfo(ctx context.Context) StorageInfo {
 
 	g := errgroup.WithNErrs(len(s.sets))
 	for index := range s.sets {
-		index := index
 		g.Go(func() error {
 			storageInfos[index] = s.sets[index].StorageInfo(ctx)
 			return nil
@@ -617,7 +617,6 @@ func (s *erasureSets) LocalStorageInfo(ctx context.Context, metrics bool) Storag
 
 	g := errgroup.WithNErrs(len(s.sets))
 	for index := range s.sets {
-		index := index
 		g.Go(func() error {
 			storageInfos[index] = s.sets[index].LocalStorageInfo(ctx, metrics)
 			return nil
@@ -640,7 +639,6 @@ func (s *erasureSets) Shutdown(ctx context.Context) error {
 	g := errgroup.WithNErrs(len(s.sets))
 
 	for index := range s.sets {
-		index := index
 		g.Go(func() error {
 			return s.sets[index].Shutdown(ctx)
 		}, index)
@@ -701,11 +699,9 @@ func (s *erasureSets) getHashedSet(input string) (set *erasureObjects) {
 }
 
 // listDeletedBuckets lists deleted buckets from all disks.
-func listDeletedBuckets(ctx context.Context, storageDisks []StorageAPI, delBuckets map[string]VolInfo, readQuorum int) error {
+func listDeletedBuckets(ctx context.Context, storageDisks []StorageAPI, delBuckets *xsync.MapOf[string, VolInfo], readQuorum int) error {
 	g := errgroup.WithNErrs(len(storageDisks))
-	var mu sync.Mutex
 	for index := range storageDisks {
-		index := index
 		g.Go(func() error {
 			if storageDisks[index] == nil {
 				// we ignore disk not found errors
@@ -722,11 +718,7 @@ func listDeletedBuckets(ctx context.Context, storageDisks []StorageAPI, delBucke
 				vi, err := storageDisks[index].StatVol(ctx, pathJoin(minioMetaBucket, bucketMetaPrefix, deletedBucketsPrefix, volName))
 				if err == nil {
 					vi.Name = strings.TrimSuffix(volName, SlashSeparator)
-					mu.Lock()
-					if _, ok := delBuckets[volName]; !ok {
-						delBuckets[volName] = vi
-					}
-					mu.Unlock()
+					delBuckets.Store(volName, vi)
 				}
 			}
 			return nil
@@ -872,11 +864,14 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 	}
 
 	putOpts := ObjectOptions{
-		ServerSideEncryption: dstOpts.ServerSideEncryption,
-		UserDefined:          srcInfo.UserDefined,
-		Versioned:            dstOpts.Versioned,
-		VersionID:            dstOpts.VersionID,
-		MTime:                dstOpts.MTime,
+		ServerSideEncryption:       dstOpts.ServerSideEncryption,
+		UserDefined:                srcInfo.UserDefined,
+		Versioned:                  dstOpts.Versioned,
+		VersionID:                  dstOpts.VersionID,
+		MTime:                      dstOpts.MTime,
+		EncryptFn:                  dstOpts.EncryptFn,
+		WantChecksum:               dstOpts.WantChecksum,
+		WantServerSideChecksumType: dstOpts.WantServerSideChecksumType,
 	}
 
 	return dstSet.putObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)

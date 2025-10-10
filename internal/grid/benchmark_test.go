@@ -78,7 +78,7 @@ func benchmarkGridRequests(b *testing.B, n int) {
 		for par := 1; par <= 32; par *= 2 {
 			b.Run("par="+strconv.Itoa(par*runtime.GOMAXPROCS(0)), func(b *testing.B) {
 				defer timeout(60 * time.Second)()
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				ctx, cancel := context.WithTimeout(b.Context(), 30*time.Second)
 				defer cancel()
 				b.ReportAllocs()
 				b.SetBytes(int64(len(payload) * 2))
@@ -135,7 +135,7 @@ func benchmarkGridRequests(b *testing.B, n int) {
 		for par := 1; par <= 32; par *= 2 {
 			b.Run("par="+strconv.Itoa(par*runtime.GOMAXPROCS(0)), func(b *testing.B) {
 				defer timeout(60 * time.Second)()
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				ctx, cancel := context.WithTimeout(b.Context(), 30*time.Second)
 				defer cancel()
 				b.ReportAllocs()
 				b.ResetTimer()
@@ -231,7 +231,7 @@ func benchmarkGridStreamRespOnly(b *testing.B, n int) {
 		errFatal(remote.RegisterStreamingHandler(handlerTest, StreamHandler{
 			// Send 10x response.
 			Handle: func(ctx context.Context, payload []byte, _ <-chan []byte, out chan<- []byte) *RemoteErr {
-				for i := 0; i < responses; i++ {
+				for i := range responses {
 					toSend := GetByteBuffer()[:0]
 					toSend = append(toSend, byte(i))
 					toSend = append(toSend, payload...)
@@ -285,7 +285,7 @@ func benchmarkGridStreamRespOnly(b *testing.B, n int) {
 					if conn == nil {
 						b.Fatal("No connection")
 					}
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					ctx, cancel := context.WithTimeout(b.Context(), 30*time.Second)
 					// Send the payload.
 					t := time.Now()
 					st, err := conn.NewStream(ctx, handlerTest, payload)
@@ -396,7 +396,7 @@ func benchmarkGridStreamReqOnly(b *testing.B, n int) {
 					if conn == nil {
 						b.Fatal("No connection")
 					}
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					ctx, cancel := context.WithTimeout(b.Context(), 30*time.Second)
 					// Send the payload.
 					t := time.Now()
 					st, err := conn.NewStream(ctx, handlerTest, payload)
@@ -407,7 +407,7 @@ func benchmarkGridStreamReqOnly(b *testing.B, n int) {
 						b.Fatal(err.Error())
 					}
 					got := 0
-					for i := 0; i < requests; i++ {
+					for range requests {
 						got++
 						st.Requests <- append(GetByteBuffer()[:0], payload...)
 					}
@@ -466,19 +466,14 @@ func benchmarkGridStreamTwoway(b *testing.B, n int) {
 			// Send 10x requests.
 			Handle: func(ctx context.Context, payload []byte, in <-chan []byte, out chan<- []byte) *RemoteErr {
 				got := 0
-				for {
-					select {
-					case b, ok := <-in:
-						if !ok {
-							if got != messages {
-								return NewRemoteErrf("wrong number of requests. want %d, got %d", messages, got)
-							}
-							return nil
-						}
-						out <- b
-						got++
-					}
+				for b := range in {
+					out <- b
+					got++
 				}
+				if got != messages {
+					return NewRemoteErrf("wrong number of requests. want %d, got %d", messages, got)
+				}
+				return nil
 			},
 
 			Subroute:    "some-subroute",
@@ -517,7 +512,7 @@ func benchmarkGridStreamTwoway(b *testing.B, n int) {
 					if conn == nil {
 						b.Fatal("No connection")
 					}
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					ctx, cancel := context.WithTimeout(b.Context(), 30*time.Second)
 					// Send the payload.
 					t := time.Now()
 					st, err := conn.NewStream(ctx, handlerTest, payload)
@@ -530,7 +525,7 @@ func benchmarkGridStreamTwoway(b *testing.B, n int) {
 					got := 0
 					sent := 0
 					go func() {
-						for i := 0; i < messages; i++ {
+						for range messages {
 							st.Requests <- append(GetByteBuffer()[:0], payload...)
 							if sent++; sent == messages {
 								close(st.Requests)

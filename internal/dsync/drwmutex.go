@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"math/rand"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -60,7 +61,7 @@ func init() {
 	)
 }
 
-func log(format string, data ...interface{}) {
+func log(format string, data ...any) {
 	if dsyncLog {
 		console.Printf(format, data...)
 	}
@@ -381,7 +382,7 @@ func refreshLock(ctx context.Context, ds *Dsync, id, source string, quorum int) 
 	lockNotFound, lockRefreshed := 0, 0
 	done := false
 
-	for i := 0; i < len(restClnts); i++ {
+	for range len(restClnts) {
 		select {
 		case refreshResult := <-ch:
 			if refreshResult.offline {
@@ -443,6 +444,7 @@ func lock(ctx context.Context, ds *Dsync, locks *[]string, id, source string, is
 	// Special context for NetLockers - do not use timeouts.
 	// Also, pass the trace context info if found for debugging
 	netLockCtx := context.Background()
+
 	tc, ok := ctx.Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt)
 	if ok {
 		netLockCtx = context.WithValue(netLockCtx, mcontext.ContextTraceKey, tc)
@@ -620,13 +622,7 @@ func (dm *DRWMutex) Unlock(ctx context.Context) {
 		defer dm.m.Unlock()
 
 		// Check if minimally a single bool is set in the writeLocks array
-		lockFound := false
-		for _, uid := range dm.writeLocks {
-			if isLocked(uid) {
-				lockFound = true
-				break
-			}
-		}
+		lockFound := slices.ContainsFunc(dm.writeLocks, isLocked)
 		if !lockFound {
 			panic("Trying to Unlock() while no Lock() is active")
 		}
@@ -671,13 +667,7 @@ func (dm *DRWMutex) RUnlock(ctx context.Context) {
 		defer dm.m.Unlock()
 
 		// Check if minimally a single bool is set in the writeLocks array
-		lockFound := false
-		for _, uid := range dm.readLocks {
-			if isLocked(uid) {
-				lockFound = true
-				break
-			}
-		}
+		lockFound := slices.ContainsFunc(dm.readLocks, isLocked)
 		if !lockFound {
 			panic("Trying to RUnlock() while no RLock() is active")
 		}

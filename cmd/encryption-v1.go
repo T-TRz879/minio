@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"path"
 	"strconv"
@@ -37,7 +38,6 @@ import (
 	"github.com/minio/kms-go/kes"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/etag"
-	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
@@ -109,7 +109,7 @@ func kmsKeyIDFromMetadata(metadata map[string]string) string {
 // be AWS S3 compliant.
 //
 // DecryptETags uses a KMS bulk decryption API, if available, which
-// is more efficient than decrypting ETags sequentually.
+// is more efficient than decrypting ETags sequentially.
 func DecryptETags(ctx context.Context, k *kms.KMS, objects []ObjectInfo) error {
 	const BatchSize = 250 // We process the objects in batches - 250 is a reasonable default.
 	var (
@@ -118,10 +118,7 @@ func DecryptETags(ctx context.Context, k *kms.KMS, objects []ObjectInfo) error {
 		names    = make([]string, 0, BatchSize)
 	)
 	for len(objects) > 0 {
-		N := BatchSize
-		if len(objects) < BatchSize {
-			N = len(objects)
-		}
+		N := min(len(objects), BatchSize)
 		batch := objects[:N]
 
 		// We have to decrypt only ETags of SSE-S3 single-part
@@ -318,9 +315,7 @@ func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byt
 		// of the client provided context and add the bucket
 		// key, if not present.
 		kmsCtx := kms.Context{}
-		for k, v := range cryptoCtx {
-			kmsCtx[k] = v
-		}
+		maps.Copy(kmsCtx, cryptoCtx)
 		if _, ok := kmsCtx[bucket]; !ok {
 			kmsCtx[bucket] = path.Join(bucket, object)
 		}
@@ -347,8 +342,8 @@ func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byt
 				return errInvalidSSEParameters // AWS returns special error for equal but invalid keys.
 			}
 			return crypto.ErrInvalidCustomerKey // To provide strict AWS S3 compatibility we return: access denied.
-
 		}
+
 		if subtle.ConstantTimeCompare(oldKey, newKey) == 1 && sealedKey.Algorithm == crypto.SealAlgorithm {
 			return nil // don't rotate on equal keys if seal algorithm is latest
 		}
@@ -390,9 +385,7 @@ func newEncryptMetadata(ctx context.Context, kind crypto.Type, keyID string, key
 		// of the client provided context and add the bucket
 		// key, if not present.
 		kmsCtx := kms.Context{}
-		for k, v := range cryptoCtx {
-			kmsCtx[k] = v
-		}
+		maps.Copy(kmsCtx, cryptoCtx)
 		if _, ok := kmsCtx[bucket]; !ok {
 			kmsCtx[bucket] = path.Join(bucket, object)
 		}
@@ -427,7 +420,7 @@ func newEncryptReader(ctx context.Context, content io.Reader, kind crypto.Type, 
 		return nil, crypto.ObjectKey{}, err
 	}
 
-	reader, err := sio.EncryptReader(content, sio.Config{Key: objectEncryptionKey[:], MinVersion: sio.Version20, CipherSuites: fips.DARECiphers()})
+	reader, err := sio.EncryptReader(content, sio.Config{Key: objectEncryptionKey[:], MinVersion: sio.Version20})
 	if err != nil {
 		return nil, crypto.ObjectKey{}, crypto.ErrInvalidCustomerKey
 	}
@@ -457,7 +450,7 @@ func setEncryptionMetadata(r *http.Request, bucket, object string, metadata map[
 		}
 	}
 	_, err = newEncryptMetadata(r.Context(), kind, keyID, key, bucket, object, metadata, kmsCtx)
-	return
+	return err
 }
 
 // EncryptRequest takes the client provided content and encrypts the data
@@ -570,7 +563,6 @@ func newDecryptReaderWithObjectKey(client io.Reader, objectEncryptionKey []byte,
 	reader, err := sio.DecryptReader(client, sio.Config{
 		Key:            objectEncryptionKey,
 		SequenceNumber: seqNumber,
-		CipherSuites:   fips.DARECiphers(),
 	})
 	if err != nil {
 		return nil, crypto.ErrInvalidCustomerKey
@@ -863,7 +855,7 @@ func tryDecryptETag(key []byte, encryptedETag string, sses3 bool) string {
 func (o *ObjectInfo) GetDecryptedRange(rs *HTTPRangeSpec) (encOff, encLength, skipLen int64, seqNumber uint32, partStart int, err error) {
 	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
 		err = errors.New("Object is not encrypted")
-		return
+		return encOff, encLength, skipLen, seqNumber, partStart, err
 	}
 
 	if rs == nil {
@@ -881,7 +873,7 @@ func (o *ObjectInfo) GetDecryptedRange(rs *HTTPRangeSpec) (encOff, encLength, sk
 			partSize, err = sio.DecryptedSize(uint64(part.Size))
 			if err != nil {
 				err = errObjectTampered
-				return
+				return encOff, encLength, skipLen, seqNumber, partStart, err
 			}
 			sizes[i] = int64(partSize)
 			decObjSize += int64(partSize)
@@ -891,7 +883,7 @@ func (o *ObjectInfo) GetDecryptedRange(rs *HTTPRangeSpec) (encOff, encLength, sk
 		partSize, err = sio.DecryptedSize(uint64(o.Size))
 		if err != nil {
 			err = errObjectTampered
-			return
+			return encOff, encLength, skipLen, seqNumber, partStart, err
 		}
 		sizes = []int64{int64(partSize)}
 		decObjSize = sizes[0]
@@ -900,7 +892,7 @@ func (o *ObjectInfo) GetDecryptedRange(rs *HTTPRangeSpec) (encOff, encLength, sk
 	var off, length int64
 	off, length, err = rs.GetOffsetLength(decObjSize)
 	if err != nil {
-		return
+		return encOff, encLength, skipLen, seqNumber, partStart, err
 	}
 
 	// At this point, we have:
@@ -1015,7 +1007,7 @@ func DecryptObjectInfo(info *ObjectInfo, r *http.Request) (encrypted bool, err e
 
 	if encrypted {
 		if crypto.SSEC.IsEncrypted(info.UserDefined) {
-			if !(crypto.SSEC.IsRequested(headers) || crypto.SSECopy.IsRequested(headers)) {
+			if !crypto.SSEC.IsRequested(headers) && !crypto.SSECopy.IsRequested(headers) {
 				if r.Header.Get(xhttp.MinIOSourceReplicationRequest) != "true" {
 					return encrypted, errEncryptedObject
 				}
@@ -1062,7 +1054,7 @@ func metadataEncrypter(key crypto.ObjectKey) objectMetaEncryptFn {
 		var buffer bytes.Buffer
 		mac := hmac.New(sha256.New, key[:])
 		mac.Write([]byte(baseKey))
-		if _, err := sio.Encrypt(&buffer, bytes.NewReader(data), sio.Config{Key: mac.Sum(nil), CipherSuites: fips.DARECiphers()}); err != nil {
+		if _, err := sio.Encrypt(&buffer, bytes.NewReader(data), sio.Config{Key: mac.Sum(nil)}); err != nil {
 			logger.CriticalIf(context.Background(), errors.New("unable to encrypt using object key"))
 		}
 		return buffer.Bytes()
@@ -1076,8 +1068,16 @@ func (o *ObjectInfo) metadataDecrypter(h http.Header) objectMetaDecryptFn {
 			return input, nil
 		}
 		var key []byte
-		if k, err := crypto.SSEC.ParseHTTP(h); err == nil {
-			key = k[:]
+		if crypto.SSECopy.IsRequested(h) {
+			sseCopyKey, err := crypto.SSECopy.ParseHTTP(h)
+			if err != nil {
+				return nil, err
+			}
+			key = sseCopyKey[:]
+		} else {
+			if k, err := crypto.SSEC.ParseHTTP(h); err == nil {
+				key = k[:]
+			}
 		}
 		key, err := decryptObjectMeta(key, o.Bucket, o.Name, o.UserDefined)
 		if err != nil {
@@ -1085,11 +1085,12 @@ func (o *ObjectInfo) metadataDecrypter(h http.Header) objectMetaDecryptFn {
 		}
 		mac := hmac.New(sha256.New, key)
 		mac.Write([]byte(baseKey))
-		return sio.DecryptBuffer(nil, input, sio.Config{Key: mac.Sum(nil), CipherSuites: fips.DARECiphers()})
+		return sio.DecryptBuffer(nil, input, sio.Config{Key: mac.Sum(nil)})
 	}
 }
 
-// decryptPartsChecksums will attempt to decode checksums and return it/them if set.
+// decryptPartsChecksums will attempt to decrypt and decode part checksums, and save
+// only the decrypted part checksum values on ObjectInfo directly.
 // if part > 0, and we have the checksum for the part that will be returned.
 func (o *ObjectInfo) decryptPartsChecksums(h http.Header) {
 	data := o.Checksum
@@ -1099,7 +1100,9 @@ func (o *ObjectInfo) decryptPartsChecksums(h http.Header) {
 	if _, encrypted := crypto.IsEncrypted(o.UserDefined); encrypted {
 		decrypted, err := o.metadataDecrypter(h)("object-checksum", data)
 		if err != nil {
-			encLogIf(GlobalContext, err)
+			if !errors.Is(err, crypto.ErrSecretKeyMismatch) {
+				encLogIf(GlobalContext, err)
+			}
 			return
 		}
 		data = decrypted
@@ -1110,7 +1113,23 @@ func (o *ObjectInfo) decryptPartsChecksums(h http.Header) {
 			o.Parts[i].Checksums = cs[i]
 		}
 	}
-	return
+}
+
+// decryptChecksum will attempt to decrypt the ObjectInfo.Checksum, returns the decrypted value
+// An error is only returned if it was encrypted and the decryption failed.
+func (o *ObjectInfo) decryptChecksum(h http.Header) ([]byte, error) {
+	data := o.Checksum
+	if len(data) == 0 {
+		return data, nil
+	}
+	if _, encrypted := crypto.IsEncrypted(o.UserDefined); encrypted {
+		decrypted, err := o.metadataDecrypter(h)("object-checksum", data)
+		if err != nil {
+			return nil, err
+		}
+		data = decrypted
+	}
+	return data, nil
 }
 
 // metadataEncryptFn provides an encryption function for metadata.
@@ -1153,16 +1172,17 @@ func (o *ObjectInfo) metadataEncryptFn(headers http.Header) (objectMetaEncryptFn
 
 // decryptChecksums will attempt to decode checksums and return it/them if set.
 // if part > 0, and we have the checksum for the part that will be returned.
-func (o *ObjectInfo) decryptChecksums(part int, h http.Header) map[string]string {
+// Returns whether the checksum (main part 0) is a multipart checksum.
+func (o *ObjectInfo) decryptChecksums(part int, h http.Header) (cs map[string]string, isMP bool) {
 	data := o.Checksum
 	if len(data) == 0 {
-		return nil
+		return nil, false
 	}
 	if part > 0 && !crypto.SSEC.IsEncrypted(o.UserDefined) {
 		// already decrypted in ToObjectInfo for multipart objects
 		for _, pi := range o.Parts {
 			if pi.Number == part {
-				return pi.Checksums
+				return pi.Checksums, true
 			}
 		}
 	}
@@ -1172,7 +1192,7 @@ func (o *ObjectInfo) decryptChecksums(part int, h http.Header) map[string]string
 			if err != crypto.ErrSecretKeyMismatch {
 				encLogIf(GlobalContext, err)
 			}
-			return nil
+			return nil, part > 0
 		}
 		data = decrypted
 	}

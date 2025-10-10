@@ -34,9 +34,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/minio/madmin-go/v3/logger/log"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/logger/target/types"
-	"github.com/minio/pkg/v3/logger/message/log"
+	types "github.com/minio/minio/internal/logger/target/loggertypes"
 )
 
 const (
@@ -113,7 +113,7 @@ func (t *testLogger) Cancel() {
 	t.current.Store(nil)
 }
 
-func (t *testLogger) Send(ctx context.Context, entry interface{}) error {
+func (t *testLogger) Send(ctx context.Context, entry any) error {
 	tb := t.current.Load()
 	var logf func(format string, args ...any)
 	if tb != nil {

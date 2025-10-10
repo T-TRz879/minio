@@ -20,12 +20,15 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,6 +37,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -42,13 +46,14 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/felixge/fgprof"
 	"github.com/minio/madmin-go/v3"
+	xaudit "github.com/minio/madmin-go/v3/logger/audit"
 	"github.com/minio/minio-go/v7"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/api"
 	xtls "github.com/minio/minio/internal/config/identity/tls"
 	"github.com/minio/minio/internal/config/storageclass"
-	"github.com/minio/minio/internal/fips"
+	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
@@ -59,7 +64,6 @@ import (
 	"github.com/minio/mux"
 	"github.com/minio/pkg/v3/certs"
 	"github.com/minio/pkg/v3/env"
-	xaudit "github.com/minio/pkg/v3/logger/message/audit"
 	xnet "github.com/minio/pkg/v3/net"
 	"golang.org/x/oauth2"
 )
@@ -215,9 +219,7 @@ func path2BucketObject(s string) (bucket, prefix string) {
 // If input is nil an empty map is returned, not nil.
 func cloneMSS(v map[string]string) map[string]string {
 	r := make(map[string]string, len(v))
-	for k, v := range v {
-		r[k] = v
-	}
+	maps.Copy(r, v)
 	return r
 }
 
@@ -234,7 +236,7 @@ func nopCharsetConverter(label string, input io.Reader) (io.Reader, error) {
 }
 
 // xmlDecoder provide decoded value in xml.
-func xmlDecoder(body io.Reader, v interface{}, size int64) error {
+func xmlDecoder(body io.Reader, v any, size int64) error {
 	var lbody io.Reader
 	if size > 0 {
 		lbody = io.LimitReader(body, size)
@@ -254,10 +256,28 @@ func xmlDecoder(body io.Reader, v interface{}, size int64) error {
 	return err
 }
 
-// hasContentMD5 returns true if Content-MD5 header is set.
-func hasContentMD5(h http.Header) bool {
-	_, ok := h[xhttp.ContentMD5]
-	return ok
+// validateLengthAndChecksum returns if a content checksum is set,
+// and will replace r.Body with a reader that checks the provided checksum
+func validateLengthAndChecksum(r *http.Request) bool {
+	if mdFive := r.Header.Get(xhttp.ContentMD5); mdFive != "" {
+		want, err := base64.StdEncoding.DecodeString(mdFive)
+		if err != nil {
+			return false
+		}
+		r.Body = hash.NewChecker(r.Body, md5.New(), want, r.ContentLength)
+		return true
+	}
+	cs, err := hash.GetContentChecksum(r.Header)
+	if err != nil {
+		return false
+	}
+	if cs == nil || !cs.Type.IsSet() {
+		return false
+	}
+	if cs.Valid() && !cs.Type.Trailing() {
+		r.Body = hash.NewChecker(r.Body, cs.Type.Hasher(), cs.Raw, r.ContentLength)
+	}
+	return true
 }
 
 // http://docs.aws.amazon.com/AmazonS3/latest/dev/UploadingObjects.html
@@ -411,7 +431,12 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return nil, err
 		}
 		stop := fgprof.Start(f, fgprof.FormatPprof)
+		startedAt := time.Now()
 		prof.stopFn = func() ([]byte, error) {
+			if elapsed := time.Since(startedAt); elapsed < 100*time.Millisecond {
+				// Light hack around https://github.com/felixge/fgprof/pull/34
+				time.Sleep(100*time.Millisecond - elapsed)
+			}
 			err := stop()
 			if err != nil {
 				return nil, err
@@ -586,8 +611,8 @@ func NewInternodeHTTPTransport(maxIdleConnsPerHost int) func() http.RoundTripper
 		LookupHost:       globalDNSCache.LookupHost,
 		DialTimeout:      rest.DefaultTimeout,
 		RootCAs:          globalRootCAs,
-		CipherSuites:     fips.TLSCiphers(),
-		CurvePreferences: fips.TLSCurveIDs(),
+		CipherSuites:     crypto.TLSCiphers(),
+		CurvePreferences: crypto.TLSCurveIDs(),
 		EnableHTTP2:      false,
 		TCPOptions:       globalTCPOptions,
 	}.NewInternodeHTTPTransport(maxIdleConnsPerHost)
@@ -600,8 +625,8 @@ func NewHTTPTransportWithClientCerts(clientCert, clientKey string) http.RoundTri
 		LookupHost:       globalDNSCache.LookupHost,
 		DialTimeout:      defaultDialTimeout,
 		RootCAs:          globalRootCAs,
-		CipherSuites:     fips.TLSCiphersBackwardCompatible(),
-		CurvePreferences: fips.TLSCurveIDs(),
+		CipherSuites:     crypto.TLSCiphersBackwardCompatible(),
+		CurvePreferences: crypto.TLSCurveIDs(),
 		TCPOptions:       globalTCPOptions,
 		EnableHTTP2:      false,
 	}
@@ -639,8 +664,8 @@ func NewHTTPTransportWithTimeout(timeout time.Duration) *http.Transport {
 		DialTimeout:      defaultDialTimeout,
 		RootCAs:          globalRootCAs,
 		TCPOptions:       globalTCPOptions,
-		CipherSuites:     fips.TLSCiphersBackwardCompatible(),
-		CurvePreferences: fips.TLSCurveIDs(),
+		CipherSuites:     crypto.TLSCiphersBackwardCompatible(),
+		CurvePreferences: crypto.TLSCurveIDs(),
 		EnableHTTP2:      false,
 	}.NewHTTPTransportWithTimeout(timeout)
 }
@@ -651,8 +676,8 @@ func NewRemoteTargetHTTPTransport(insecure bool) func() *http.Transport {
 	return xhttp.ConnSettings{
 		LookupHost:       globalDNSCache.LookupHost,
 		RootCAs:          globalRootCAs,
-		CipherSuites:     fips.TLSCiphersBackwardCompatible(),
-		CurvePreferences: fips.TLSCurveIDs(),
+		CipherSuites:     crypto.TLSCiphersBackwardCompatible(),
+		CurvePreferences: crypto.TLSCurveIDs(),
 		TCPOptions:       globalTCPOptions,
 		EnableHTTP2:      false,
 	}.NewRemoteTargetHTTPTransport(insecure)
@@ -664,7 +689,7 @@ func NewRemoteTargetHTTPTransport(insecure bool) func() *http.Transport {
 func ceilFrac(numerator, denominator int64) (ceil int64) {
 	if denominator == 0 {
 		// do nothing on invalid input
-		return
+		return ceil
 	}
 	// Make denominator positive
 	if denominator < 0 {
@@ -675,7 +700,7 @@ func ceilFrac(numerator, denominator int64) (ceil int64) {
 	if numerator > 0 && numerator%denominator != 0 {
 		ceil++
 	}
-	return
+	return ceil
 }
 
 // cleanMinioInternalMetadataKeys removes X-Amz-Meta- prefix from minio internal
@@ -818,14 +843,11 @@ func lcp(strs []string, pre bool) string {
 			return ""
 		}
 		// maximum possible length
-		maxl := xfixl
-		if strl < maxl {
-			maxl = strl
-		}
+		maxl := min(strl, xfixl)
 		// compare letters
 		if pre {
 			// prefix, iterate left to right
-			for i := 0; i < maxl; i++ {
+			for i := range maxl {
 				if xfix[i] != str[i] {
 					xfix = xfix[:i]
 					break
@@ -833,7 +855,7 @@ func lcp(strs []string, pre bool) string {
 			}
 		} else {
 			// suffix, iterate right to left
-			for i := 0; i < maxl; i++ {
+			for i := range maxl {
 				xi := xfixl - i - 1
 				si := strl - i - 1
 				if xfix[xi] != str[si] {
@@ -927,7 +949,7 @@ func auditLogInternal(ctx context.Context, opts AuditLogOptions) {
 	entry.API.Bucket = opts.Bucket
 	entry.API.Objects = []xaudit.ObjectVersion{{ObjectName: opts.Object, VersionID: opts.VersionID}}
 	entry.API.Status = opts.Status
-	entry.Tags = make(map[string]interface{}, len(opts.Tags))
+	entry.Tags = make(map[string]any, len(opts.Tags))
 	for k, v := range opts.Tags {
 		entry.Tags[k] = v
 	}
@@ -960,11 +982,11 @@ func newTLSConfig(getCert certs.GetCertificateFunc) *tls.Config {
 	}
 
 	if secureCiphers := env.Get(api.EnvAPISecureCiphers, config.EnableOn) == config.EnableOn; secureCiphers {
-		tlsConfig.CipherSuites = fips.TLSCiphers()
+		tlsConfig.CipherSuites = crypto.TLSCiphers()
 	} else {
-		tlsConfig.CipherSuites = fips.TLSCiphersBackwardCompatible()
+		tlsConfig.CipherSuites = crypto.TLSCiphersBackwardCompatible()
 	}
-	tlsConfig.CurvePreferences = fips.TLSCurveIDs()
+	tlsConfig.CurvePreferences = crypto.TLSCurveIDs()
 	return tlsConfig
 }
 
@@ -1150,4 +1172,18 @@ func filterStorageClass(ctx context.Context, s string) string {
 		return globalVeeamForceSC
 	}
 	return s
+}
+
+type ordered interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr | ~float32 | ~float64 | string
+}
+
+// mapKeysSorted returns the map keys as a sorted slice.
+func mapKeysSorted[Map ~map[K]V, K ordered, V any](m Map) []K {
+	res := make([]K, 0, len(m))
+	for k := range m {
+		res = append(res, k)
+	}
+	slices.Sort(res)
+	return res
 }

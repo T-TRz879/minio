@@ -96,7 +96,7 @@ func isRequestSignStreamingTrailerV4(r *http.Request) bool {
 // Verify if the request has AWS Streaming Signature Version '4', with unsigned content and trailer.
 func isRequestUnsignedTrailerV4(r *http.Request) bool {
 	return r.Header.Get(xhttp.AmzContentSha256) == unsignedPayloadTrailer &&
-		r.Method == http.MethodPut && strings.Contains(r.Header.Get(xhttp.ContentEncoding), streamingContentEncoding)
+		r.Method == http.MethodPut
 }
 
 // Authorization type.
@@ -162,7 +162,6 @@ func validateAdminSignature(ctx context.Context, r *http.Request, region string)
 	s3Err := ErrAccessDenied
 	if _, ok := r.Header[xhttp.AmzContentSha256]; ok &&
 		getRequestAuthType(r) == authTypeSigned {
-
 		// Get credential information from the request.
 		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
 		if s3Err != ErrNone {
@@ -217,12 +216,12 @@ func getSessionToken(r *http.Request) (token string) {
 
 // Fetch claims in the security token returned by the client, doesn't return
 // errors - upon errors the returned claims map will be empty.
-func mustGetClaimsFromToken(r *http.Request) map[string]interface{} {
+func mustGetClaimsFromToken(r *http.Request) map[string]any {
 	claims, _ := getClaimsFromToken(getSessionToken(r))
 	return claims
 }
 
-func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{}, error) {
+func getClaimsFromTokenWithSecret(token, secret string) (*xjwt.MapClaims, error) {
 	// JWT token for x-amz-security-token is signed with admin
 	// secret key, temporary credentials become invalid if
 	// server admin credentials change. This is done to ensure
@@ -244,7 +243,7 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
 
 	// If AuthZPlugin is set, return without any further checks.
 	if newGlobalAuthZPluginFn() != nil {
-		return claims.Map(), nil
+		return claims, nil
 	}
 
 	// Check if a session policy is set. If so, decode it here.
@@ -263,16 +262,20 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
 		claims.MapClaims[sessionPolicyNameExtracted] = string(spBytes)
 	}
 
-	return claims.Map(), nil
+	return claims, nil
 }
 
 // Fetch claims in the security token returned by the client.
-func getClaimsFromToken(token string) (map[string]interface{}, error) {
-	return getClaimsFromTokenWithSecret(token, globalActiveCred.SecretKey)
+func getClaimsFromToken(token string) (map[string]any, error) {
+	jwtClaims, err := getClaimsFromTokenWithSecret(token, globalActiveCred.SecretKey)
+	if err != nil {
+		return nil, err
+	}
+	return jwtClaims.Map(), nil
 }
 
 // Fetch claims in the security token returned by the client and validate the token.
-func checkClaimsFromToken(r *http.Request, cred auth.Credentials) (map[string]interface{}, APIErrorCode) {
+func checkClaimsFromToken(r *http.Request, cred auth.Credentials) (map[string]any, APIErrorCode) {
 	token := getSessionToken(r)
 	if token != "" && cred.AccessKey == "" {
 		// x-amz-security-token is not allowed for anonymous access.
@@ -319,7 +322,7 @@ func checkClaimsFromToken(r *http.Request, cred auth.Credentials) (map[string]in
 		if err != nil {
 			return nil, toAPIErrorCode(r.Context(), err)
 		}
-		return claims, ErrNone
+		return claims.Map(), ErrNone
 	}
 
 	claims := xjwt.NewMapClaims()
@@ -360,7 +363,7 @@ func authenticateRequest(ctx context.Context, r *http.Request, action policy.Act
 	var cred auth.Credentials
 	var owner bool
 	switch getRequestAuthType(r) {
-	case authTypeUnknown, authTypeStreamingSigned:
+	case authTypeUnknown, authTypeStreamingSigned, authTypeStreamingSignedTrailer, authTypeStreamingUnsignedTrailer:
 		return ErrSignatureVersionNotSupported
 	case authTypePresignedV2, authTypeSignedV2:
 		if s3Err = isReqAuthenticatedV2(r); s3Err != ErrNone {
@@ -671,32 +674,6 @@ func setAuthMiddleware(h http.Handler) http.Handler {
 	})
 }
 
-func validateSignature(atype authType, r *http.Request) (auth.Credentials, bool, APIErrorCode) {
-	var cred auth.Credentials
-	var owner bool
-	var s3Err APIErrorCode
-	switch atype {
-	case authTypeUnknown, authTypeStreamingSigned:
-		return cred, owner, ErrSignatureVersionNotSupported
-	case authTypeSignedV2, authTypePresignedV2:
-		if s3Err = isReqAuthenticatedV2(r); s3Err != ErrNone {
-			return cred, owner, s3Err
-		}
-		cred, owner, s3Err = getReqAccessKeyV2(r)
-	case authTypePresigned, authTypeSigned:
-		region := globalSite.Region()
-		if s3Err = isReqAuthenticated(GlobalContext, r, region, serviceS3); s3Err != ErrNone {
-			return cred, owner, s3Err
-		}
-		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
-	}
-	if s3Err != ErrNone {
-		return cred, owner, s3Err
-	}
-
-	return cred, owner, ErrNone
-}
-
 func isPutRetentionAllowed(bucketName, objectName string, retDays int, retDate time.Time, retMode objectlock.RetMode, byPassSet bool, r *http.Request, cred auth.Credentials, owner bool) (s3Err APIErrorCode) {
 	var retSet bool
 	if cred.AccessKey == "" {
@@ -751,8 +728,14 @@ func isPutActionAllowed(ctx context.Context, atype authType, bucketName, objectN
 		return ErrSignatureVersionNotSupported
 	case authTypeSignedV2, authTypePresignedV2:
 		cred, owner, s3Err = getReqAccessKeyV2(r)
-	case authTypeStreamingSigned, authTypePresigned, authTypeSigned, authTypeStreamingSignedTrailer, authTypeStreamingUnsignedTrailer:
+	case authTypeStreamingSigned, authTypePresigned, authTypeSigned, authTypeStreamingSignedTrailer:
 		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
+	case authTypeStreamingUnsignedTrailer:
+		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
+		if s3Err == ErrMissingFields {
+			// Could be anonymous. cred + owner is zero value.
+			s3Err = ErrNone
+		}
 	}
 	if s3Err != ErrNone {
 		return s3Err

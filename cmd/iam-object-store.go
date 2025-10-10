@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path"
 	"strings"
 	"sync"
@@ -80,7 +81,7 @@ func (iamOS *IAMObjectStore) getUsersSysType() UsersSysType {
 	return iamOS.usersSysType
 }
 
-func (iamOS *IAMObjectStore) saveIAMConfig(ctx context.Context, item interface{}, objPath string, opts ...options) error {
+func (iamOS *IAMObjectStore) saveIAMConfig(ctx context.Context, item any, objPath string, opts ...options) error {
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	data, err := json.Marshal(item)
 	if err != nil {
@@ -135,7 +136,7 @@ func (iamOS *IAMObjectStore) loadIAMConfigBytesWithMetadata(ctx context.Context,
 	return data, meta, nil
 }
 
-func (iamOS *IAMObjectStore) loadIAMConfig(ctx context.Context, item interface{}, objPath string) error {
+func (iamOS *IAMObjectStore) loadIAMConfig(ctx context.Context, item any, objPath string) error {
 	data, _, err := iamOS.loadIAMConfigBytesWithMetadata(ctx, objPath)
 	if err != nil {
 		return err
@@ -278,7 +279,6 @@ func (iamOS *IAMObjectStore) loadUserIdentity(ctx context.Context, user string, 
 				iamOS.deleteIAMConfig(ctx, getMappedPolicyPath(user, userType, false))
 			}
 			return u, errNoSuchUser
-
 		}
 		u.Credentials.Claims = jwtClaims.Map()
 	}
@@ -295,7 +295,6 @@ func (iamOS *IAMObjectStore) loadUserConcurrent(ctx context.Context, userType IA
 	g := errgroup.WithNErrs(len(users))
 
 	for index := range users {
-		index := index
 		g.Go(func() error {
 			userName := path.Dir(users[index])
 			user, err := iamOS.loadUserIdentity(ctx, userName, userType)
@@ -414,7 +413,6 @@ func (iamOS *IAMObjectStore) loadMappedPolicyConcurrent(ctx context.Context, use
 	g := errgroup.WithNErrs(len(users))
 
 	for index := range users {
-		index := index
 		g.Go(func() error {
 			userName := strings.TrimSuffix(users[index], ".json")
 			userMP, err := iamOS.loadMappedPolicyInternal(ctx, userName, userType, isGroup)
@@ -481,12 +479,24 @@ var (
 	policyDBGroupsListKey   = "policydb/groups/"
 )
 
+func findSecondIndex(s string, substr string) int {
+	first := strings.Index(s, substr)
+	if first == -1 {
+		return -1
+	}
+	second := strings.Index(s[first+1:], substr)
+	if second == -1 {
+		return -1
+	}
+	return first + second + 1
+}
+
 // splitPath splits a path into a top-level directory and a child item. The
 // parent directory retains the trailing slash.
-func splitPath(s string, lastIndex bool) (string, string) {
+func splitPath(s string, secondIndex bool) (string, string) {
 	var i int
-	if lastIndex {
-		i = strings.LastIndex(s, "/")
+	if secondIndex {
+		i = findSecondIndex(s, "/")
 	} else {
 		i = strings.Index(s, "/")
 	}
@@ -506,8 +516,8 @@ func (iamOS *IAMObjectStore) listAllIAMConfigItems(ctx context.Context) (res map
 			return nil, item.Err
 		}
 
-		lastIndex := strings.HasPrefix(item.Item, policyDBPrefix)
-		listKey, trimmedItem := splitPath(item.Item, lastIndex)
+		secondIndex := strings.HasPrefix(item.Item, policyDBPrefix)
+		listKey, trimmedItem := splitPath(item.Item, secondIndex)
 		if listKey == iamFormatFile {
 			continue
 		}
@@ -527,7 +537,6 @@ func (iamOS *IAMObjectStore) loadPolicyDocConcurrent(ctx context.Context, polici
 	g := errgroup.WithNErrs(len(policies))
 
 	for index := range policies {
-		index := index
 		g.Go(func() error {
 			policyName := path.Dir(policies[index])
 			policyDoc, err := iamOS.loadPolicy(ctx, policyName)
@@ -765,9 +774,7 @@ func (iamOS *IAMObjectStore) loadAllFromObjStore(ctx context.Context, cache *iam
 	}
 
 	// Copy svcUsersMap to cache.iamUsersMap
-	for k, v := range svcUsersMap {
-		cache.iamUsersMap[k] = v
-	}
+	maps.Copy(cache.iamUsersMap, svcUsersMap)
 
 	cache.buildUserGroupMemberships()
 
@@ -781,7 +788,10 @@ func (iamOS *IAMObjectStore) loadAllFromObjStore(ctx context.Context, cache *iam
 	for _, item := range listedConfigItems[stsListKey] {
 		userName := path.Dir(item)
 		// loadUser() will delete expired user during the load.
-		iamLogIf(ctx, iamOS.loadUser(ctx, userName, stsUser, stsAccountsFromStore))
+		err := iamOS.loadUser(ctx, userName, stsUser, stsAccountsFromStore)
+		if err != nil && !errors.Is(err, errNoSuchUser) {
+			iamLogIf(ctx, err)
+		}
 		// No need to return errors for failed expiration of STS users
 	}
 
@@ -789,7 +799,10 @@ func (iamOS *IAMObjectStore) loadAllFromObjStore(ctx context.Context, cache *iam
 	// (removed during loadUser() in the loop above) are removed from memory.
 	for _, item := range listedConfigItems[policyDBSTSUsersListKey] {
 		stsName := strings.TrimSuffix(item, ".json")
-		iamLogIf(ctx, iamOS.loadMappedPolicy(ctx, stsName, stsUser, false, stsAccPoliciesFromStore))
+		err := iamOS.loadMappedPolicy(ctx, stsName, stsUser, false, stsAccPoliciesFromStore)
+		if err != nil && !errors.Is(err, errNoSuchPolicy) {
+			iamLogIf(ctx, err)
+		}
 		// No need to return errors for failed expiration of STS users
 	}
 

@@ -24,9 +24,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/minio/madmin-go/v3/logger/audit"
 	internalAudit "github.com/minio/minio/internal/logger/message/audit"
 	"github.com/minio/minio/internal/mcontext"
-	"github.com/minio/pkg/v3/logger/message/audit"
 
 	xhttp "github.com/minio/minio/internal/http"
 )
@@ -60,7 +60,7 @@ func GetAuditEntry(ctx context.Context) *audit.Entry {
 }
 
 // AuditLog - logs audit logs to all audit targets.
-func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqClaims map[string]interface{}, filterKeys ...string) {
+func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqClaims map[string]any, filterKeys ...string) {
 	auditTgts := AuditTargets()
 	if len(auditTgts) == 0 {
 		return
@@ -100,7 +100,7 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 			outputBytes = int64(tc.ResponseRecorder.Size())
 			headerBytes = int64(tc.ResponseRecorder.HeaderSize())
 			timeToResponse = time.Now().UTC().Sub(tc.ResponseRecorder.StartTime)
-			timeToFirstByte = tc.ResponseRecorder.TimeToFirstByte
+			timeToFirstByte = tc.ResponseRecorder.TTFB()
 		}
 
 		entry.AccessKey = reqInfo.Cred.AccessKey
@@ -124,7 +124,7 @@ func AuditLog(ctx context.Context, w http.ResponseWriter, r *http.Request, reqCl
 		entry.API.TimeToResponse = strconv.FormatInt(timeToResponse.Nanoseconds(), 10) + "ns"
 		entry.API.TimeToResponseInNS = strconv.FormatInt(timeToResponse.Nanoseconds(), 10)
 		// We hold the lock, so we cannot call reqInfo.GetTagsMap().
-		tags := make(map[string]interface{}, len(reqInfo.tags))
+		tags := make(map[string]any, len(reqInfo.tags))
 		for _, t := range reqInfo.tags {
 			tags[t.Key] = t.Val
 		}

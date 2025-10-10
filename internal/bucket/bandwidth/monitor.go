@@ -21,6 +21,7 @@ package bandwidth
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -83,12 +84,7 @@ func SelectBuckets(buckets ...string) SelectionFunction {
 		}
 	}
 	return func(bucket string) bool {
-		for _, bkt := range buckets {
-			if bkt == bucket {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(buckets, bucket)
 	}
 }
 
@@ -127,7 +123,6 @@ func (m *Monitor) getReport(selectBucket SelectionFunction) *BucketBandwidthRepo
 			}
 		}
 		m.tlock.RUnlock()
-
 	}
 	return report
 }

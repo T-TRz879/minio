@@ -160,7 +160,7 @@ func (s *TestSuiteIAM) SetUpSuite(c *check) {
 }
 
 func (s *TestSuiteIAM) RestartIAMSuite(c *check) {
-	s.TestSuiteCommon.RestartTestServer(c)
+	s.RestartTestServer(c)
 
 	s.iamSetup(c)
 }
@@ -332,22 +332,30 @@ func (s *TestSuiteIAM) TestUserPolicyEscalationBug(c *check) {
 
 	// 2.2 create and associate policy to user
 	policy := "mypolicy-test-user-update"
-	policyBytes := []byte(fmt.Sprintf(`{
+	policyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket)
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -443,7 +451,7 @@ func (s *TestSuiteIAM) TestAddServiceAccountPerms(c *check) {
     "s3:ListBucket"
    ],
    "Resource": [
-    "arn:aws:s3:::testbucket/*"
+    "arn:aws:s3:::testbucket"
    ]
   }
  ]
@@ -554,22 +562,30 @@ func (s *TestSuiteIAM) TestPolicyCreate(c *check) {
 
 	// 1. Create a policy
 	policy := "mypolicy"
-	policyBytes := []byte(fmt.Sprintf(`{
+	policyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket)
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -664,22 +680,30 @@ func (s *TestSuiteIAM) TestCannedPolicies(c *check) {
 		c.Fatalf("bucket creat error: %v", err)
 	}
 
-	policyBytes := []byte(fmt.Sprintf(`{
+	policyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket)
 
 	// Check that default policies can be overwritten.
 	err = s.adm.AddCannedPolicy(ctx, "readwrite", policyBytes)
@@ -690,6 +714,12 @@ func (s *TestSuiteIAM) TestCannedPolicies(c *check) {
 	info, err := s.adm.InfoCannedPolicy(ctx, "readwrite")
 	if err != nil {
 		c.Fatalf("policy info err: %v", err)
+	}
+
+	// Check that policy with comma is rejected.
+	err = s.adm.AddCannedPolicy(ctx, "invalid,policy", policyBytes)
+	if err == nil {
+		c.Fatalf("invalid policy created successfully")
 	}
 
 	infoStr := string(info)
@@ -709,22 +739,30 @@ func (s *TestSuiteIAM) TestGroupAddRemove(c *check) {
 	}
 
 	policy := "mypolicy"
-	policyBytes := []byte(fmt.Sprintf(`{
+	policyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket)
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -873,22 +911,30 @@ func (s *TestSuiteIAM) TestServiceAccountOpsByUser(c *check) {
 
 	// Create policy, user and associate policy
 	policy := "mypolicy"
-	policyBytes := []byte(fmt.Sprintf(`{
+	policyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket)
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -949,7 +995,7 @@ func (s *TestSuiteIAM) TestServiceAccountDurationSecondsCondition(c *check) {
 
 	// Create policy, user and associate policy
 	policy := "mypolicy"
-	policyBytes := []byte(fmt.Sprintf(`{
+	policyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
@@ -963,16 +1009,24 @@ func (s *TestSuiteIAM) TestServiceAccountDurationSecondsCondition(c *check) {
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket)
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -1039,22 +1093,30 @@ func (s *TestSuiteIAM) TestServiceAccountOpsByAdmin(c *check) {
 
 	// Create policy, user and associate policy
 	policy := "mypolicy"
-	policyBytes := []byte(fmt.Sprintf(`{
+	policyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
    "Effect": "Allow",
    "Action": [
-    "s3:PutObject",
-    "s3:GetObject",
     "s3:ListBucket"
+   ],
+   "Resource": [
+    "arn:aws:s3:::%s"
+   ]
+  },
+  {
+   "Effect": "Allow",
+   "Action": [
+    "s3:PutObject",
+    "s3:GetObject"
    ],
    "Resource": [
     "arn:aws:s3:::%s/*"
    ]
   }
  ]
-}`, bucket))
+}`, bucket, bucket)
 	err = s.adm.AddCannedPolicy(ctx, policy, policyBytes)
 	if err != nil {
 		c.Fatalf("policy add error: %v", err)
@@ -1305,7 +1367,7 @@ func (s *TestSuiteIAM) TestAccMgmtPlugin(c *check) {
 		svcAK, svcSK := mustGenerateCredentials(c)
 
 		// This policy does not allow listing objects.
-		policyBytes := []byte(fmt.Sprintf(`{
+		policyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
@@ -1319,7 +1381,7 @@ func (s *TestSuiteIAM) TestAccMgmtPlugin(c *check) {
    ]
   }
  ]
-}`, bucket))
+}`, bucket)
 		cr, err := userAdmClient.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
 			Policy:     policyBytes,
 			TargetUser: accessKey,
@@ -1496,7 +1558,7 @@ func (c *check) mustDownload(ctx context.Context, client *minio.Client, bucket s
 func (c *check) mustUploadReturnVersions(ctx context.Context, client *minio.Client, bucket string) []string {
 	c.Helper()
 	versions := []string{}
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		ui, err := client.PutObject(ctx, bucket, "some-object", bytes.NewBuffer([]byte("stuff")), 5, minio.PutObjectOptions{})
 		if err != nil {
 			c.Fatalf("upload did not succeed got %#v", err)
@@ -1565,7 +1627,7 @@ func (c *check) assertSvcAccSessionPolicyUpdate(ctx context.Context, s *TestSuit
 	svcAK, svcSK := mustGenerateCredentials(c)
 
 	// This policy does not allow listing objects.
-	policyBytes := []byte(fmt.Sprintf(`{
+	policyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
@@ -1579,7 +1641,7 @@ func (c *check) assertSvcAccSessionPolicyUpdate(ctx context.Context, s *TestSuit
    ]
   }
  ]
-}`, bucket))
+}`, bucket)
 	cr, err := madmClient.AddServiceAccount(ctx, madmin.AddServiceAccountReq{
 		Policy:     policyBytes,
 		TargetUser: accessKey,
@@ -1593,7 +1655,7 @@ func (c *check) assertSvcAccSessionPolicyUpdate(ctx context.Context, s *TestSuit
 	c.mustNotListObjects(ctx, svcClient, bucket)
 
 	// This policy allows listing objects.
-	newPolicyBytes := []byte(fmt.Sprintf(`{
+	newPolicyBytes := fmt.Appendf(nil, `{
  "Version": "2012-10-17",
  "Statement": [
   {
@@ -1602,11 +1664,11 @@ func (c *check) assertSvcAccSessionPolicyUpdate(ctx context.Context, s *TestSuit
     "s3:ListBucket"
    ],
    "Resource": [
-    "arn:aws:s3:::%s/*"
+    "arn:aws:s3:::%s"
    ]
   }
  ]
-}`, bucket))
+}`, bucket)
 	err = madmClient.UpdateServiceAccount(ctx, svcAK, madmin.UpdateServiceAccountReq{
 		NewPolicy: newPolicyBytes,
 	})

@@ -27,7 +27,6 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/tags"
@@ -196,8 +195,8 @@ func (ef BatchJobExpireFilter) Matches(obj ObjectInfo, now time.Time) bool {
 				return false
 			}
 		}
-
 	}
+
 	if len(ef.Metadata) > 0 && !obj.DeleteMarker {
 		for _, kv := range ef.Metadata {
 			// Object (version) must match all x-amz-meta and
@@ -289,6 +288,16 @@ type BatchJobExpire struct {
 }
 
 var _ yaml.Unmarshaler = &BatchJobExpire{}
+
+// RedactSensitive will redact any sensitive information in b.
+func (r *BatchJobExpire) RedactSensitive() {
+	if r == nil {
+		return
+	}
+	if r.NotificationCfg.Token != "" {
+		r.NotificationCfg.Token = redactedText
+	}
+}
 
 // UnmarshalYAML - BatchJobExpire extends default unmarshal to extract line, col information.
 func (r *BatchJobExpire) UnmarshalYAML(val *yaml.Node) error {
@@ -389,9 +398,12 @@ func (oiCache objInfoCache) Get(toDel ObjectToDelete) (*ObjectInfo, bool) {
 
 func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo, job BatchJobRequest, api ObjectLayer, wk *workers.Workers, expireCh <-chan []expireObjInfo) {
 	vc, _ := globalBucketVersioningSys.Get(r.Bucket)
-	retryAttempts := r.Retry.Attempts
+	retryAttempts := job.Expire.Retry.Attempts
+	if retryAttempts <= 0 {
+		retryAttempts = batchExpireJobDefaultRetries
+	}
 	delay := job.Expire.Retry.Delay
-	if delay == 0 {
+	if delay <= 0 {
 		delay = batchExpireJobDefaultRetryDelay
 	}
 
@@ -412,12 +424,12 @@ func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo
 		go func(toExpire []expireObjInfo) {
 			defer wk.Give()
 
-			toExpireAll := make([]ObjectInfo, 0, len(toExpire))
+			toExpireAll := make([]expireObjInfo, 0, len(toExpire))
 			toDel := make([]ObjectToDelete, 0, len(toExpire))
 			oiCache := newObjInfoCache()
 			for _, exp := range toExpire {
 				if exp.ExpireAll {
-					toExpireAll = append(toExpireAll, exp.ObjectInfo)
+					toExpireAll = append(toExpireAll, exp)
 					continue
 				}
 				// Cache ObjectInfo value via pointers for
@@ -433,14 +445,14 @@ func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo
 				oiCache.Add(od, &exp.ObjectInfo)
 			}
 
-			var done bool
 			// DeleteObject(deletePrefix: true) to expire all versions of an object
 			for _, exp := range toExpireAll {
 				var success bool
 				for attempts := 1; attempts <= retryAttempts; attempts++ {
 					select {
 					case <-ctx.Done():
-						done = true
+						ri.trackMultipleObjectVersions(exp, success)
+						return
 					default:
 					}
 					stopFn := globalBatchJobsMetrics.trace(batchJobMetricExpire, ri.JobID, attempts)
@@ -457,14 +469,7 @@ func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo
 						break
 					}
 				}
-				ri.trackMultipleObjectVersions(r.Bucket, exp, success)
-				if done {
-					break
-				}
-			}
-
-			if done {
-				return
+				ri.trackMultipleObjectVersions(exp, success)
 			}
 
 			// DeleteMultiple objects
@@ -522,7 +527,8 @@ func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo
 
 type expireObjInfo struct {
 	ObjectInfo
-	ExpireAll bool
+	ExpireAll         bool
+	DeleteMarkerCount int64
 }
 
 // Start the batch expiration job, resumes if there was a pending job via "job.ID"
@@ -557,9 +563,13 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 
 	results := make(chan itemOrErr[ObjectInfo], workerSize)
 	go func() {
-		for _, prefix := range r.Prefix.F() {
+		prefixes := r.Prefix.F()
+		if len(prefixes) == 0 {
+			prefixes = []string{""}
+		}
+		for _, prefix := range prefixes {
 			prefixResultCh := make(chan itemOrErr[ObjectInfo], workerSize)
-			err := api.Walk(ctx, r.Bucket, strings.TrimSpace(prefix), prefixResultCh, WalkOptions{
+			err := api.Walk(ctx, r.Bucket, prefix, prefixResultCh, WalkOptions{
 				Marker:       lastObject,
 				LatestOnly:   false, // we need to visit all versions of the object to implement purge: retainVersions
 				VersionsSort: WalkVersionsSortDesc,
@@ -615,80 +625,115 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 		matchedFilter BatchJobExpireFilter
 		versionsCount int
 		toDel         []expireObjInfo
+		failed        bool
+		done          bool
 	)
-	failed := false
-	for result := range results {
-		if result.Err != nil {
-			failed = true
-			batchLogIf(ctx, result.Err)
-			continue
+	deleteMarkerCountMap := map[string]int64{}
+	pushToExpire := func() {
+		// set preObject deleteMarkerCount
+		if len(toDel) > 0 {
+			lastDelIndex := len(toDel) - 1
+			lastDel := toDel[lastDelIndex]
+			if lastDel.ExpireAll {
+				toDel[lastDelIndex].DeleteMarkerCount = deleteMarkerCountMap[lastDel.Name]
+				// delete the key
+				delete(deleteMarkerCountMap, lastDel.Name)
+			}
 		}
-
-		// Apply filter to find the matching rule to apply expiry
-		// actions accordingly.
-		// nolint:gocritic
-		if result.Item.IsLatest {
-			// send down filtered entries to be deleted using
-			// DeleteObjects method
-			if len(toDel) > 10 { // batch up to 10 objects/versions to be expired simultaneously.
-				xfer := make([]expireObjInfo, len(toDel))
-				copy(xfer, toDel)
-
-				var done bool
-				select {
-				case <-ctx.Done():
-					done = true
-				case expireCh <- xfer:
-					toDel = toDel[:0] // resetting toDel
-				}
-				if done {
-					break
-				}
+		// send down filtered entries to be deleted using
+		// DeleteObjects method
+		if len(toDel) > 10 { // batch up to 10 objects/versions to be expired simultaneously.
+			xfer := make([]expireObjInfo, len(toDel))
+			copy(xfer, toDel)
+			select {
+			case expireCh <- xfer:
+				toDel = toDel[:0] // resetting toDel
+			case <-ctx.Done():
+				done = true
 			}
-			var match BatchJobExpireFilter
-			var found bool
-			for _, rule := range r.Rules {
-				if rule.Matches(result.Item, now) {
-					match = rule
-					found = true
-					break
-				}
-			}
-			if !found {
-				continue
-			}
-
-			prevObj = result.Item
-			matchedFilter = match
-			versionsCount = 1
-			// Include the latest version
-			if matchedFilter.Purge.RetainVersions == 0 {
-				toDel = append(toDel, expireObjInfo{
-					ObjectInfo: result.Item,
-					ExpireAll:  true,
-				})
-				continue
-			}
-		} else if prevObj.Name == result.Item.Name {
-			if matchedFilter.Purge.RetainVersions == 0 {
-				continue // including latest version in toDel suffices, skipping other versions
-			}
-			versionsCount++
-		} else {
-			continue
 		}
-
-		if versionsCount <= matchedFilter.Purge.RetainVersions {
-			continue // retain versions
-		}
-		toDel = append(toDel, expireObjInfo{
-			ObjectInfo: result.Item,
-		})
 	}
+	for {
+		select {
+		case result, ok := <-results:
+			if !ok {
+				done = true
+				break
+			}
+			if result.Err != nil {
+				failed = true
+				batchLogIf(ctx, result.Err)
+				continue
+			}
+			if result.Item.DeleteMarker {
+				deleteMarkerCountMap[result.Item.Name]++
+			}
+			// Apply filter to find the matching rule to apply expiry
+			// actions accordingly.
+			// nolint:gocritic
+			if result.Item.IsLatest {
+				var match BatchJobExpireFilter
+				var found bool
+				for _, rule := range r.Rules {
+					if rule.Matches(result.Item, now) {
+						match = rule
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+
+				if prevObj.Name != result.Item.Name {
+					// switch the object
+					pushToExpire()
+				}
+
+				prevObj = result.Item
+				matchedFilter = match
+				versionsCount = 1
+				// Include the latest version
+				if matchedFilter.Purge.RetainVersions == 0 {
+					toDel = append(toDel, expireObjInfo{
+						ObjectInfo: result.Item,
+						ExpireAll:  true,
+					})
+					continue
+				}
+			} else if prevObj.Name == result.Item.Name {
+				if matchedFilter.Purge.RetainVersions == 0 {
+					continue // including latest version in toDel suffices, skipping other versions
+				}
+				versionsCount++
+			} else {
+				// switch the object
+				pushToExpire()
+				// a file switched with no LatestVersion, logging it
+				batchLogIf(ctx, fmt.Errorf("skipping object %s, no latest version found", result.Item.Name))
+				continue
+			}
+
+			if versionsCount <= matchedFilter.Purge.RetainVersions {
+				continue // retain versions
+			}
+			toDel = append(toDel, expireObjInfo{
+				ObjectInfo: result.Item,
+			})
+			pushToExpire()
+		case <-ctx.Done():
+			done = true
+		}
+		if done {
+			break
+		}
+	}
+
 	if context.Cause(ctx) != nil {
 		xioutil.SafeClose(expireCh)
 		return context.Cause(ctx)
 	}
+	pushToExpire()
 	// Send any remaining objects downstream
 	if len(toDel) > 0 {
 		select {

@@ -87,7 +87,7 @@ func (d *DummyDataGen) Read(b []byte) (n int, err error) {
 		}
 		err = io.EOF
 	}
-	return
+	return n, err
 }
 
 func (d *DummyDataGen) Seek(offset int64, whence int) (int64, error) {
@@ -165,7 +165,7 @@ func TestCmpReaders(t *testing.T) {
 		r1 := bytes.NewReader([]byte("abc"))
 		r2 := bytes.NewReader([]byte("abc"))
 		ok, msg := cmpReaders(r1, r2)
-		if !(ok && msg == "") {
+		if !ok || msg != "" {
 			t.Fatalf("unexpected")
 		}
 	}

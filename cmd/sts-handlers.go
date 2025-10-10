@@ -55,6 +55,7 @@ const (
 	stsDurationSeconds        = "DurationSeconds"
 	stsLDAPUsername           = "LDAPUsername"
 	stsLDAPPassword           = "LDAPPassword"
+	stsRevokeTokenType        = "TokenRevokeType"
 
 	// STS API action constants
 	clientGrants        = "AssumeRoleWithClientGrants"
@@ -85,11 +86,14 @@ const (
 	// Role Claim key
 	roleArnClaim = "roleArn"
 
+	// STS revoke type claim key
+	tokenRevokeTypeClaim = "tokenRevokeType"
+
 	// maximum supported STS session policy size
 	maxSTSSessionPolicySize = 2048
 )
 
-type stsClaims map[string]interface{}
+type stsClaims map[string]any
 
 func (c stsClaims) populateSessionPolicy(form url.Values) error {
 	if len(form) == 0 {
@@ -307,6 +311,11 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 	claims[expClaim] = UTCNow().Add(duration).Unix()
 	claims[parentClaim] = user.AccessKey
 
+	tokenRevokeType := r.Form.Get(stsRevokeTokenType)
+	if tokenRevokeType != "" {
+		claims[tokenRevokeTypeClaim] = tokenRevokeType
+	}
+
 	// Validate that user.AccessKey's policies can be retrieved - it may not
 	// be in case the user is disabled.
 	if _, err = globalIAMSys.PolicyDBGet(user.AccessKey, user.Groups...); err != nil {
@@ -407,13 +416,26 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 	// defined parameter to disambiguate the intended IDP in this STS request.
 	roleArn := openid.DummyRoleARN
 	roleArnStr := r.Form.Get(stsRoleArn)
-	if roleArnStr != "" {
+	isRolePolicyProvider := roleArnStr != ""
+	if isRolePolicyProvider {
 		var err error
 		roleArn, _, err = globalIAMSys.GetRolePolicy(roleArnStr)
 		if err != nil {
-			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
-				fmt.Errorf("Error processing %s parameter: %v", stsRoleArn, err))
-			return
+			// If there is no claim-based provider configured, then an
+			// unrecognized roleArn is an error
+			if strings.TrimSpace(iamPolicyClaimNameOpenID()) == "" {
+				writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
+					fmt.Errorf("Error processing %s parameter: %v", stsRoleArn, err))
+				return
+			}
+			// If there *is* a claim-based provider configured, then
+			// treat an unrecognized roleArn the same as no roleArn
+			// at all.  This is to support clients like the AWS SDKs
+			// or CLI that will not allow an AssumeRoleWithWebIdentity
+			// call without a RoleARN parameter - for these cases the
+			// user can supply a dummy ARN, which Minio will ignore.
+			roleArn = openid.DummyRoleARN
+			isRolePolicyProvider = false
 		}
 	}
 
@@ -442,7 +464,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 	}
 
 	var policyName string
-	if roleArnStr != "" && globalIAMSys.HasRolePolicy() {
+	if isRolePolicyProvider {
 		// If roleArn is used, we set it as a claim, and use the
 		// associated policy when credentials are used.
 		claims[roleArnClaim] = roleArn.String()
@@ -469,6 +491,11 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 			}
 		}
 		claims[iamPolicyClaimNameOpenID()] = policyName
+	}
+
+	tokenRevokeType := r.Form.Get(stsRevokeTokenType)
+	if tokenRevokeType != "" {
+		claims[tokenRevokeTypeClaim] = tokenRevokeType
 	}
 
 	if err := claims.populateSessionPolicy(r.Form); err != nil {
@@ -530,6 +557,14 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 			if err != nil {
 				writeSTSErrorResponse(ctx, w, ErrSTSAccessDenied, err)
 				return
+			}
+			if newGlobalAuthZPluginFn() == nil {
+				// if authZ is not set - we expect the policies to be present.
+				if globalIAMSys.CurrentPolicies(p) == "" {
+					writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
+						fmt.Errorf("None of the given policies (`%s`) are defined, credentials will not be generated", p))
+					return
+				}
 			}
 		}
 
@@ -691,6 +726,10 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 	for attrib, value := range lookupResult.Attributes {
 		claims[ldapAttribPrefix+attrib] = value
 	}
+	tokenRevokeType := r.Form.Get(stsRevokeTokenType)
+	if tokenRevokeType != "" {
+		claims[tokenRevokeTypeClaim] = tokenRevokeType
+	}
 
 	secret, err := getTokenSigningKey()
 	if err != nil {
@@ -752,7 +791,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "AssumeRoleWithCertificate")
 
-	claims := make(map[string]interface{})
+	claims := make(map[string]any)
 	defer logger.AuditLog(ctx, w, r, claims)
 
 	if !globalIAMSys.Initialized() {
@@ -780,12 +819,26 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 	// policy mapping would be ambiguous.
 	// However, we can filter all CA certificates and only check
 	// whether they client has sent exactly one (non-CA) leaf certificate.
-	peerCertificates := make([]*x509.Certificate, 0, len(r.TLS.PeerCertificates))
+	const MaxIntermediateCAs = 10
+	var (
+		peerCertificates = make([]*x509.Certificate, 0, len(r.TLS.PeerCertificates))
+		intermediates    *x509.CertPool
+		numIntermediates int
+	)
 	for _, cert := range r.TLS.PeerCertificates {
 		if cert.IsCA {
-			continue
+			numIntermediates++
+			if numIntermediates > MaxIntermediateCAs {
+				writeSTSErrorResponse(ctx, w, ErrSTSTooManyIntermediateCAs, fmt.Errorf("client certificate contains more than %d intermediate CAs", MaxIntermediateCAs))
+				return
+			}
+			if intermediates == nil {
+				intermediates = x509.NewCertPool()
+			}
+			intermediates.AddCert(cert)
+		} else {
+			peerCertificates = append(peerCertificates, cert)
 		}
-		peerCertificates = append(peerCertificates, cert)
 	}
 	r.TLS.PeerCertificates = peerCertificates
 
@@ -806,7 +859,8 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 			KeyUsages: []x509.ExtKeyUsage{
 				x509.ExtKeyUsageClientAuth,
 			},
-			Roots: globalRootCAs,
+			Intermediates: intermediates,
+			Roots:         globalRootCAs,
 		})
 		if err != nil {
 			writeSTSErrorResponse(ctx, w, ErrSTSInvalidClientCertificate, err)
@@ -872,6 +926,11 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 	claims[audClaim] = certificate.Subject.Organization
 	claims[issClaim] = certificate.Issuer.CommonName
 	claims[parentClaim] = parentUser
+	tokenRevokeType := r.Form.Get(stsRevokeTokenType)
+	if tokenRevokeType != "" {
+		claims[tokenRevokeTypeClaim] = tokenRevokeType
+	}
+
 	secretKey, err := getTokenSigningKey()
 	if err != nil {
 		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
@@ -918,7 +977,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 func (sts *stsAPIHandlers) AssumeRoleWithCustomToken(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "AssumeRoleWithCustomToken")
 
-	claims := make(map[string]interface{})
+	claims := make(map[string]any)
 
 	auditLogFilterKeys := []string{stsToken}
 	defer logger.AuditLog(ctx, w, r, claims, auditLogFilterKeys...)
@@ -965,6 +1024,20 @@ func (sts *stsAPIHandlers) AssumeRoleWithCustomToken(w http.ResponseWriter, r *h
 		return
 	}
 
+	_, policyName, err := globalIAMSys.GetRolePolicy(roleArnStr)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSAccessDenied, err)
+		return
+	}
+
+	if newGlobalAuthZPluginFn() == nil { // if authZ is not set - we expect the policyname to be present.
+		if globalIAMSys.CurrentPolicies(policyName) == "" {
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue,
+				fmt.Errorf("None of the given policies (`%s`) are defined, credentials will not be generated", policyName))
+			return
+		}
+	}
+
 	res, err := authn.Authenticate(roleArn, token)
 	if err != nil {
 		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
@@ -997,6 +1070,10 @@ func (sts *stsAPIHandlers) AssumeRoleWithCustomToken(w http.ResponseWriter, r *h
 	claims[subClaim] = parentUser
 	claims[roleArnClaim] = roleArn.String()
 	claims[parentClaim] = parentUser
+	tokenRevokeType := r.Form.Get(stsRevokeTokenType)
+	if tokenRevokeType != "" {
+		claims[tokenRevokeTypeClaim] = tokenRevokeType
+	}
 
 	// Add all other claims from the plugin **without** replacing any
 	// existing claims.

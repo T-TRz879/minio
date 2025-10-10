@@ -25,8 +25,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bcicen/jstream"
 	csv "github.com/minio/csvparser"
+	"github.com/minio/minio/internal/s3select/jstream"
 	"github.com/minio/minio/internal/s3select/sql"
 )
 
@@ -46,8 +46,8 @@ func (r *Record) Get(name string) (*sql.Value, error) {
 	index, found := r.nameIndexMap[name]
 	if !found {
 		// Check if index.
-		if strings.HasPrefix(name, "_") {
-			idx, err := strconv.Atoi(strings.TrimPrefix(name, "_"))
+		if after, ok := strings.CutPrefix(name, "_"); ok {
+			idx, err := strconv.Atoi(after)
 			if err != nil {
 				return nil, fmt.Errorf("column %v not found", name)
 			}
@@ -87,9 +87,7 @@ func (r *Record) Reset() {
 	if len(r.csvRecord) > 0 {
 		r.csvRecord = r.csvRecord[:0]
 	}
-	for k := range r.nameIndexMap {
-		delete(r.nameIndexMap, k)
-	}
+	clear(r.nameIndexMap)
 }
 
 // Clone the record.
@@ -135,12 +133,12 @@ func (r *Record) WriteJSON(writer io.Writer) error {
 }
 
 // Raw - returns the underlying data with format info.
-func (r *Record) Raw() (sql.SelectObjectFormat, interface{}) {
+func (r *Record) Raw() (sql.SelectObjectFormat, any) {
 	return sql.SelectFmtCSV, r
 }
 
 // Replace - is not supported for CSV
-func (r *Record) Replace(_ interface{}) error {
+func (r *Record) Replace(_ any) error {
 	return errors.New("Replace is not supported for CSV")
 }
 

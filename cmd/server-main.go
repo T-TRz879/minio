@@ -31,6 +31,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -46,6 +47,7 @@ import (
 	"github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/api"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
@@ -53,7 +55,6 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v3/certs"
 	"github.com/minio/pkg/v3/env"
-	"golang.org/x/exp/slices"
 	"gopkg.in/yaml.v2"
 )
 
@@ -421,12 +422,14 @@ func serverHandleCmdArgs(ctxt serverCtxt) {
 		Interface:   ctxt.Interface,
 		SendBufSize: ctxt.SendBufSize,
 		RecvBufSize: ctxt.RecvBufSize,
+		IdleTimeout: ctxt.IdleTimeout,
 	}
 
 	// allow transport to be HTTP/1.1 for proxying.
-	globalProxyEndpoints = GetProxyEndpoints(globalEndpoints)
 	globalInternodeTransport = NewInternodeHTTPTransport(ctxt.MaxIdleConnsPerHost)()
 	globalRemoteTargetTransport = NewRemoteTargetHTTPTransport(false)()
+	globalProxyEndpoints = GetProxyEndpoints(globalEndpoints, globalRemoteTargetTransport)
+
 	globalForwarder = handlers.NewForwarder(&handlers.Forwarder{
 		PassHost:     true,
 		RoundTripper: globalRemoteTargetTransport,
@@ -449,7 +452,9 @@ func initAllSubsystems(ctx context.Context) {
 	globalNotificationSys = NewNotificationSys(globalEndpoints)
 
 	// Create new notification system
-	globalEventNotifier = NewEventNotifier(GlobalContext)
+	if globalEventNotifier == nil {
+		globalEventNotifier = NewEventNotifier(GlobalContext)
+	}
 
 	// Create new bucket metadata system.
 	if globalBucketMetadataSys == nil {
@@ -790,10 +795,6 @@ func serverMain(ctx *cli.Context) {
 	// Handle all server environment vars.
 	serverHandleEnvVars()
 
-	// Load the root credentials from the shell environment or from
-	// the config file if not defined, set the default one.
-	loadRootCredentials()
-
 	// Perform any self-tests
 	bootstrapTrace("selftests", func() {
 		bitrotSelfTest()
@@ -803,6 +804,29 @@ func serverMain(ctx *cli.Context) {
 
 	// Initialize KMS configuration
 	bootstrapTrace("handleKMSConfig", handleKMSConfig)
+
+	// Load the root credentials from the shell environment or from
+	// the config file if not defined, set the default one.
+	bootstrapTrace("rootCredentials", func() {
+		cred := loadRootCredentials()
+		if !cred.IsValid() && (env.Get(api.EnvAPIRootAccess, config.EnableOn) == config.EnableOff) {
+			// Generate KMS based credentials if root access is disabled
+			// and no ENV is set.
+			cred = autoGenerateRootCredentials()
+		}
+
+		if !cred.IsValid() {
+			cred = auth.DefaultCredentials
+		}
+
+		var err error
+		globalNodeAuthToken, err = authenticateNode(cred.AccessKey, cred.SecretKey)
+		if err != nil {
+			logger.Fatal(err, "Unable to generate internode credentials")
+		}
+
+		globalActiveCred = cred
+	})
 
 	// Initialize all help
 	bootstrapTrace("initHelp", initHelp)
@@ -878,6 +902,8 @@ func serverMain(ctx *cli.Context) {
 			UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 			UseTLSConfig(newTLSConfig(getCert)).
 			UseIdleTimeout(globalServerCtxt.IdleTimeout).
+			UseReadTimeout(globalServerCtxt.IdleTimeout).
+			UseWriteTimeout(globalServerCtxt.IdleTimeout).
 			UseReadHeaderTimeout(globalServerCtxt.ReadHeaderTimeout).
 			UseBaseContext(GlobalContext).
 			UseCustomLogger(log.New(io.Discard, "", 0)). // Turn-off random logging by Go stdlib
@@ -1104,6 +1130,11 @@ func serverMain(ctx *cli.Context) {
 		// Initialize batch job pool.
 		bootstrapTrace("newBatchJobPool", func() {
 			globalBatchJobPool = newBatchJobPool(GlobalContext, newObject, 100)
+			globalBatchJobsMetrics = batchJobMetrics{
+				metrics: make(map[string]*batchJobInfo),
+			}
+			go globalBatchJobsMetrics.init(GlobalContext, newObject)
+			go globalBatchJobsMetrics.purgeJobMetrics()
 		})
 
 		// Prints the formatted startup message, if err is not nil then it prints additional information as well.

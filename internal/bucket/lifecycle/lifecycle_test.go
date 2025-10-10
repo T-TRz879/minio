@@ -120,11 +120,15 @@ func TestParseAndValidateLifecycleConfig(t *testing.T) {
 			expectedParsingErr:    errDuplicatedXMLTag,
 			expectedValidationErr: nil,
 		},
-		{ // lifecycle config with no rules
+		{ // lifecycle config without prefixes
 			inputConfig: `<LifecycleConfiguration>
+					  <Rule>
+		                          <Expiration><Days>3</Days></Expiration>
+                                          <Status>Enabled</Status>
+		                          </Rule>
 		                          </LifecycleConfiguration>`,
 			expectedParsingErr:    nil,
-			expectedValidationErr: errLifecycleNoRule,
+			expectedValidationErr: nil,
 		},
 		{ // lifecycle config with rules having overlapping prefix
 			inputConfig:           `<LifecycleConfiguration><Rule><ID>rule1</ID><Status>Enabled</Status><Filter><Prefix>/a/b</Prefix></Filter><Expiration><Days>3</Days></Expiration></Rule><Rule><ID>rule2</ID><Status>Enabled</Status><Filter><And><Prefix>/a/b/c</Prefix><Tag><Key>key1</Key><Value>val1</Value></Tag></And></Filter><Expiration><Days>3</Days></Expiration></Rule></LifecycleConfiguration> `,
@@ -734,7 +738,6 @@ func TestEval(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run("", func(t *testing.T) {
 			lc, err := ParseLifecycleConfig(bytes.NewReader([]byte(tc.inputConfig)))
 			if err != nil {
@@ -819,7 +822,6 @@ func TestHasActiveRules(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		tc := tc
 		t.Run(fmt.Sprintf("Test_%d", i+1), func(t *testing.T) {
 			lc, err := ParseLifecycleConfig(bytes.NewReader([]byte(tc.inputConfig)))
 			if err != nil {
@@ -956,7 +958,9 @@ func TestTransitionTier(t *testing.T) {
 	// Go back seven days in the past
 	now = now.Add(7 * 24 * time.Hour)
 
-	evt := lc.eval(obj1, now)
+	evaluator := NewEvaluator(lc)
+	evts := evaluator.eval([]ObjectOpts{obj1, obj2}, now)
+	evt := evts[0]
 	if evt.Action != TransitionAction {
 		t.Fatalf("Expected action: %s but got %s", TransitionAction, evt.Action)
 	}
@@ -964,7 +968,7 @@ func TestTransitionTier(t *testing.T) {
 		t.Fatalf("Expected TIER-1 but got %s", evt.StorageClass)
 	}
 
-	evt = lc.eval(obj2, now)
+	evt = evts[1]
 	if evt.Action != TransitionVersionAction {
 		t.Fatalf("Expected action: %s but got %s", TransitionVersionAction, evt.Action)
 	}
@@ -1032,14 +1036,16 @@ func TestTransitionTierWithPrefixAndTags(t *testing.T) {
 	// Go back seven days in the past
 	now = now.Add(7 * 24 * time.Hour)
 
+	evaluator := NewEvaluator(lc)
+	evts := evaluator.eval([]ObjectOpts{obj1, obj2, obj3}, now)
 	// Eval object 1
-	evt := lc.eval(obj1, now)
+	evt := evts[0]
 	if evt.Action != NoneAction {
 		t.Fatalf("Expected action: %s but got %s", NoneAction, evt.Action)
 	}
 
 	// Eval object 2
-	evt = lc.eval(obj2, now)
+	evt = evts[1]
 	if evt.Action != TransitionAction {
 		t.Fatalf("Expected action: %s but got %s", TransitionAction, evt.Action)
 	}
@@ -1048,7 +1054,7 @@ func TestTransitionTierWithPrefixAndTags(t *testing.T) {
 	}
 
 	// Eval object 3
-	evt = lc.eval(obj3, now)
+	evt = evts[2]
 	if evt.Action != TransitionAction {
 		t.Fatalf("Expected action: %s but got %s", TransitionAction, evt.Action)
 	}
@@ -1462,7 +1468,9 @@ func TestDeleteAllVersions(t *testing.T) {
 		NumVersions: 4,
 	}
 
-	event := lc.eval(opts, time.Time{})
+	evaluator := NewEvaluator(lc)
+	events := evaluator.eval([]ObjectOpts{opts}, time.Time{})
+	event := events[0]
 	if event.Action != TransitionAction {
 		t.Fatalf("Expected %v action but got %v", TransitionAction, event.Action)
 	}
@@ -1499,7 +1507,9 @@ func TestDeleteAllVersions(t *testing.T) {
 		DeleteMarker: true,
 		NumVersions:  4,
 	}
-	event = lc.eval(opts, time.Time{})
+	evaluator = NewEvaluator(lc)
+	events = evaluator.eval([]ObjectOpts{opts}, time.Time{})
+	event = events[0]
 	if event.Action != DelMarkerDeleteAllVersionsAction {
 		t.Fatalf("Expected %v action but got %v", DelMarkerDeleteAllVersionsAction, event.Action)
 	}

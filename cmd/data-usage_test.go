@@ -56,13 +56,13 @@ func TestDataUsageUpdate(t *testing.T) {
 			var s os.FileInfo
 			s, err = os.Stat(item.Path)
 			if err != nil {
-				return
+				return sizeS, err
 			}
 			sizeS.totalSize = s.Size()
 			sizeS.versions++
 			return sizeS, nil
 		}
-		return
+		return sizeS, err
 	}
 	xls := xlStorage{drivePath: base, diskInfoCache: cachevalue.New[DiskInfo]()}
 	xls.diskInfoCache.InitOnce(time.Second, cachevalue.Opts{}, func(ctx context.Context) (DiskInfo, error) {
@@ -70,7 +70,7 @@ func TestDataUsageUpdate(t *testing.T) {
 	})
 	weSleep := func() bool { return false }
 
-	got, err := scanDataFolder(context.Background(), nil, &xls, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0, weSleep)
+	got, err := scanDataFolder(t.Context(), nil, &xls, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0, weSleep)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,8 +179,8 @@ func TestDataUsageUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Changed dir must be picked up in this many cycles.
-	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = scanDataFolder(context.Background(), nil, &xls, got, getSize, 0, weSleep)
+	for range dataUsageUpdateDirCycles {
+		got, err = scanDataFolder(t.Context(), nil, &xls, got, getSize, 0, weSleep)
 		got.Info.NextCycle++
 		if err != nil {
 			t.Fatal(err)
@@ -279,13 +279,13 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 			var s os.FileInfo
 			s, err = os.Stat(item.Path)
 			if err != nil {
-				return
+				return sizeS, err
 			}
 			sizeS.totalSize = s.Size()
 			sizeS.versions++
-			return
+			return sizeS, err
 		}
-		return
+		return sizeS, err
 	}
 
 	weSleep := func() bool { return false }
@@ -294,7 +294,7 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 		return DiskInfo{Total: 1 << 40, Free: 1 << 40}, nil
 	})
 
-	got, err := scanDataFolder(context.Background(), nil, &xls, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, getSize, 0, weSleep)
+	got, err := scanDataFolder(t.Context(), nil, &xls, dataUsageCache{Info: dataUsageCacheInfo{Name: "bucket"}}, getSize, 0, weSleep)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,8 +428,8 @@ func TestDataUsageUpdatePrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Changed dir must be picked up in this many cycles.
-	for i := 0; i < dataUsageUpdateDirCycles; i++ {
-		got, err = scanDataFolder(context.Background(), nil, &xls, got, getSize, 0, weSleep)
+	for range dataUsageUpdateDirCycles {
+		got, err = scanDataFolder(t.Context(), nil, &xls, got, getSize, 0, weSleep)
 		got.Info.NextCycle++
 		if err != nil {
 			t.Fatal(err)
@@ -526,13 +526,13 @@ func createUsageTestFiles(t *testing.T, base, bucket string, files []usageTestFi
 // generateUsageTestFiles create nFolders * nFiles files of size bytes each.
 func generateUsageTestFiles(t *testing.T, base, bucket string, nFolders, nFiles, size int) {
 	pl := make([]byte, size)
-	for i := 0; i < nFolders; i++ {
+	for i := range nFolders {
 		name := filepath.Join(base, bucket, fmt.Sprint(i), "0.txt")
 		err := os.MkdirAll(filepath.Dir(name), os.ModePerm)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for j := 0; j < nFiles; j++ {
+		for j := range nFiles {
 			name := filepath.Join(base, bucket, fmt.Sprint(i), fmt.Sprint(j)+".txt")
 			err = os.WriteFile(name, pl, os.ModePerm)
 			if err != nil {
@@ -569,35 +569,24 @@ func TestDataUsageCacheSerialize(t *testing.T) {
 			var s os.FileInfo
 			s, err = os.Stat(item.Path)
 			if err != nil {
-				return
+				return sizeS, err
 			}
 			sizeS.versions++
 			sizeS.totalSize = s.Size()
-			return
+			return sizeS, err
 		}
-		return
+		return sizeS, err
 	}
 	xls := xlStorage{drivePath: base, diskInfoCache: cachevalue.New[DiskInfo]()}
 	xls.diskInfoCache.InitOnce(time.Second, cachevalue.Opts{}, func(ctx context.Context) (DiskInfo, error) {
 		return DiskInfo{Total: 1 << 40, Free: 1 << 40}, nil
 	})
 	weSleep := func() bool { return false }
-	want, err := scanDataFolder(context.Background(), nil, &xls, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0, weSleep)
+	want, err := scanDataFolder(t.Context(), nil, &xls, dataUsageCache{Info: dataUsageCacheInfo{Name: bucket}}, getSize, 0, weSleep)
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := want.find("abucket/dir2")
-	e.ReplicationStats = &replicationAllStats{
-		Targets: map[string]replicationStats{
-			"arn": {
-				PendingSize:    1,
-				ReplicatedSize: 2,
-				FailedSize:     3,
-				FailedCount:    5,
-				PendingCount:   6,
-			},
-		},
-	}
 	want.replace("abucket/dir2", "", *e)
 	var buf bytes.Buffer
 	err = want.serializeTo(&buf)
@@ -629,7 +618,7 @@ func TestDataUsageCacheSerialize(t *testing.T) {
 }
 
 // equalAsJSON returns whether the values are equal when encoded as JSON.
-func equalAsJSON(a, b interface{}) bool {
+func equalAsJSON(a, b any) bool {
 	aj, err := json.Marshal(a)
 	if err != nil {
 		panic(err)

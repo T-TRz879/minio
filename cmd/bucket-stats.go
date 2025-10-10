@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"sync/atomic"
 	"time"
@@ -37,7 +38,7 @@ type ReplicationLatency struct {
 // Merge two replication latency into a new one
 func (rl ReplicationLatency) merge(other ReplicationLatency) (newReplLatency ReplicationLatency) {
 	newReplLatency.UploadHistogram = rl.UploadHistogram.Merge(other.UploadHistogram)
-	return
+	return newReplLatency
 }
 
 // Get upload latency of each object size range
@@ -48,7 +49,7 @@ func (rl ReplicationLatency) getUploadLatency() (ret map[string]uint64) {
 		// Convert nanoseconds to milliseconds
 		ret[sizeTagToString(k)] = uint64(v.avg() / time.Millisecond)
 	}
-	return
+	return ret
 }
 
 // Update replication upload latency with a new value
@@ -63,7 +64,7 @@ type ReplicationLastMinute struct {
 
 func (rl ReplicationLastMinute) merge(other ReplicationLastMinute) (nl ReplicationLastMinute) {
 	nl = ReplicationLastMinute{rl.LastMinute.merge(other.LastMinute)}
-	return
+	return nl
 }
 
 func (rl *ReplicationLastMinute) addsize(n int64) {
@@ -108,18 +109,18 @@ func (l ReplicationLastHour) merge(o ReplicationLastHour) (merged ReplicationLas
 
 // Add  a new duration data
 func (l *ReplicationLastHour) addsize(sz int64) {
-	min := time.Now().Unix() / 60
-	l.forwardTo(min)
-	winIdx := min % 60
-	l.Totals[winIdx].merge(AccElem{Total: min, Size: sz, N: 1})
-	l.LastMin = min
+	minutes := time.Now().Unix() / 60
+	l.forwardTo(minutes)
+	winIdx := minutes % 60
+	l.Totals[winIdx].merge(AccElem{Total: minutes, Size: sz, N: 1})
+	l.LastMin = minutes
 }
 
 // Merge all recorded counts of last hour into one
 func (l *ReplicationLastHour) getTotal() AccElem {
 	var res AccElem
-	min := time.Now().Unix() / 60
-	l.forwardTo(min)
+	minutes := time.Now().Unix() / 60
+	l.forwardTo(minutes)
 	for _, elem := range l.Totals[:] {
 		res.merge(elem)
 	}
@@ -221,9 +222,7 @@ func (brs BucketReplicationStats) Clone() (c BucketReplicationStats) {
 		}
 		if s.Failed.ErrCounts == nil {
 			s.Failed.ErrCounts = make(map[string]int)
-			for k, v := range st.Failed.ErrCounts {
-				s.Failed.ErrCounts[k] = v
-			}
+			maps.Copy(s.Failed.ErrCounts, st.Failed.ErrCounts)
 		}
 		c.Stats[arn] = &s
 	}
@@ -310,7 +309,12 @@ type ReplQNodeStats struct {
 func (r *ReplicationStats) getNodeQueueStats(bucket string) (qs ReplQNodeStats) {
 	qs.NodeName = globalLocalNodeName
 	qs.Uptime = UTCNow().Unix() - globalBootTime.Unix()
-	qs.ActiveWorkers = globalReplicationStats.Load().ActiveWorkers()
+	grs := globalReplicationStats.Load()
+	if grs != nil {
+		qs.ActiveWorkers = grs.ActiveWorkers()
+	} else {
+		qs.ActiveWorkers = ActiveWorkerStat{}
+	}
 	qs.XferStats = make(map[RMetricName]XferStats)
 	qs.QStats = r.qCache.getBucketStats(bucket)
 	qs.TgtXferStats = make(map[string]map[RMetricName]XferStats)

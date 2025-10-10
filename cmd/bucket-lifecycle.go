@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -71,8 +72,12 @@ func NewLifecycleSys() *LifecycleSys {
 	return &LifecycleSys{}
 }
 
-func ilmTrace(startTime time.Time, duration time.Duration, oi ObjectInfo, event string, metadata map[string]string) madmin.TraceInfo {
+func ilmTrace(startTime time.Time, duration time.Duration, oi ObjectInfo, event string, metadata map[string]string, err string) madmin.TraceInfo {
 	sz, _ := oi.GetActualSize()
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	metadata["version-id"] = oi.VersionID
 	return madmin.TraceInfo{
 		TraceType: madmin.TraceILM,
 		Time:      startTime,
@@ -81,18 +86,22 @@ func ilmTrace(startTime time.Time, duration time.Duration, oi ObjectInfo, event 
 		Duration:  duration,
 		Path:      pathJoin(oi.Bucket, oi.Name),
 		Bytes:     sz,
-		Error:     "",
+		Error:     err,
 		Message:   getSource(4),
 		Custom:    metadata,
 	}
 }
 
-func (sys *LifecycleSys) trace(oi ObjectInfo) func(event string, metadata map[string]string) {
+func (sys *LifecycleSys) trace(oi ObjectInfo) func(event string, metadata map[string]string, err error) {
 	startTime := time.Now()
-	return func(event string, metadata map[string]string) {
+	return func(event string, metadata map[string]string, err error) {
 		duration := time.Since(startTime)
 		if globalTrace.NumSubscribers(madmin.TraceILM) > 0 {
-			globalTrace.Publish(ilmTrace(startTime, duration, oi, event, metadata))
+			e := ""
+			if err != nil {
+				e = err.Error()
+			}
+			globalTrace.Publish(ilmTrace(startTime, duration, oi, event, metadata, e))
 		}
 	}
 }
@@ -147,8 +156,8 @@ func (f freeVersionTask) OpHash() uint64 {
 	return xxh3.HashString(f.TransitionedObject.Tier + f.TransitionedObject.Name)
 }
 
-func (n newerNoncurrentTask) OpHash() uint64 {
-	return xxh3.HashString(n.bucket + n.versions[0].ObjectV.ObjectName)
+func (n noncurrentVersionsTask) OpHash() uint64 {
+	return xxh3.HashString(n.bucket + n.versions[0].ObjectName)
 }
 
 func (j jentry) OpHash() uint64 {
@@ -232,14 +241,16 @@ func (es *expiryState) enqueueByDays(oi ObjectInfo, event lifecycle.Event, src l
 	}
 }
 
-// enqueueByNewerNoncurrent enqueues object versions expired by
-// NewerNoncurrentVersions limit for expiry.
-func (es *expiryState) enqueueByNewerNoncurrent(bucket string, versions []ObjectToDelete, lcEvent lifecycle.Event) {
+func (es *expiryState) enqueueNoncurrentVersions(bucket string, versions []ObjectToDelete, events []lifecycle.Event) {
 	if len(versions) == 0 {
 		return
 	}
 
-	task := newerNoncurrentTask{bucket: bucket, versions: versions, event: lcEvent}
+	task := noncurrentVersionsTask{
+		bucket:   bucket,
+		versions: versions,
+		events:   events,
+	}
 	wrkr := es.getWorkerCh(task.OpHash())
 	if wrkr == nil {
 		es.stats.missedExpiryTasks.Add(1)
@@ -339,8 +350,8 @@ func (es *expiryState) Worker(input <-chan expiryOp) {
 				} else {
 					applyExpiryOnNonTransitionedObjects(es.ctx, es.objAPI, v.objInfo, v.event, v.src)
 				}
-			case newerNoncurrentTask:
-				deleteObjectVersions(es.ctx, es.objAPI, v.bucket, v.versions, v.event)
+			case noncurrentVersionsTask:
+				deleteObjectVersions(es.ctx, es.objAPI, v.bucket, v.versions, v.events)
 			case jentry:
 				transitionLogIf(es.ctx, deleteObjectFromRemoteTier(es.ctx, v.ObjName, v.VersionID, v.TierName))
 			case freeVersionTask:
@@ -348,7 +359,7 @@ func (es *expiryState) Worker(input <-chan expiryOp) {
 				traceFn := globalLifecycleSys.trace(oi)
 				if !oi.TransitionedObject.FreeVersion {
 					// nothing to be done
-					return
+					continue
 				}
 
 				ignoreNotFoundErr := func(err error) error {
@@ -362,7 +373,8 @@ func (es *expiryState) Worker(input <-chan expiryOp) {
 				err := deleteObjectFromRemoteTier(es.ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
 				if ignoreNotFoundErr(err) != nil {
 					transitionLogIf(es.ctx, err)
-					return
+					traceFn(ILMFreeVersionDelete, nil, err)
+					continue
 				}
 
 				// Remove this free version
@@ -387,12 +399,10 @@ func initBackgroundExpiry(ctx context.Context, objectAPI ObjectLayer) {
 	globalExpiryState = newExpiryState(ctx, objectAPI, globalILMConfig.getExpirationWorkers())
 }
 
-// newerNoncurrentTask encapsulates arguments required by worker to expire objects
-// by NewerNoncurrentVersions
-type newerNoncurrentTask struct {
+type noncurrentVersionsTask struct {
 	bucket   string
 	versions []ObjectToDelete
-	event    lifecycle.Event
+	events   []lifecycle.Event
 }
 
 type transitionTask struct {
@@ -950,9 +960,7 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 			UserDefined:      meta,
 		}
 	}
-	for k, v := range objInfo.UserDefined {
-		meta[k] = v
-	}
+	maps.Copy(meta, objInfo.UserDefined)
 	if len(objInfo.UserTags) != 0 {
 		meta[xhttp.AmzObjectTagging] = objInfo.UserTags
 	}
@@ -1099,17 +1107,20 @@ func isRestoredObjectOnDisk(meta map[string]string) (onDisk bool) {
 // ToLifecycleOpts returns lifecycle.ObjectOpts value for oi.
 func (oi ObjectInfo) ToLifecycleOpts() lifecycle.ObjectOpts {
 	return lifecycle.ObjectOpts{
-		Name:             oi.Name,
-		UserTags:         oi.UserTags,
-		VersionID:        oi.VersionID,
-		ModTime:          oi.ModTime,
-		Size:             oi.Size,
-		IsLatest:         oi.IsLatest,
-		NumVersions:      oi.NumVersions,
-		DeleteMarker:     oi.DeleteMarker,
-		SuccessorModTime: oi.SuccessorModTime,
-		RestoreOngoing:   oi.RestoreOngoing,
-		RestoreExpires:   oi.RestoreExpires,
-		TransitionStatus: oi.TransitionedObject.Status,
+		Name:               oi.Name,
+		UserTags:           oi.UserTags,
+		VersionID:          oi.VersionID,
+		ModTime:            oi.ModTime,
+		Size:               oi.Size,
+		IsLatest:           oi.IsLatest,
+		NumVersions:        oi.NumVersions,
+		DeleteMarker:       oi.DeleteMarker,
+		SuccessorModTime:   oi.SuccessorModTime,
+		RestoreOngoing:     oi.RestoreOngoing,
+		RestoreExpires:     oi.RestoreExpires,
+		TransitionStatus:   oi.TransitionedObject.Status,
+		UserDefined:        oi.UserDefined,
+		VersionPurgeStatus: oi.VersionPurgeStatus,
+		ReplicationStatus:  oi.ReplicationStatus,
 	}
 }

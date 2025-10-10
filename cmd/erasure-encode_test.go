@@ -88,7 +88,7 @@ func TestErasureEncode(t *testing.T) {
 			t.Fatalf("Test %d: failed to create test setup: %v", i, err)
 		}
 		disks := setup.disks
-		erasure, err := NewErasure(context.Background(), test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
+		erasure, err := NewErasure(t.Context(), test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
 		if err != nil {
 			t.Fatalf("Test %d: failed to create ErasureStorage: %v", i, err)
 		}
@@ -105,7 +105,7 @@ func TestErasureEncode(t *testing.T) {
 			}
 			writers[i] = newBitrotWriter(disk, "", "testbucket", "object", erasure.ShardFileSize(int64(len(data[test.offset:]))), test.algorithm, erasure.ShardSize())
 		}
-		n, err := erasure.Encode(context.Background(), bytes.NewReader(data[test.offset:]), writers, buffer, erasure.dataBlocks+1)
+		n, err := erasure.Encode(t.Context(), bytes.NewReader(data[test.offset:]), writers, buffer, erasure.dataBlocks+1)
 		closeBitrotWriters(writers)
 		if err != nil && !test.shouldFail {
 			t.Errorf("Test %d: should pass but failed with: %v", i, err)
@@ -140,7 +140,7 @@ func TestErasureEncode(t *testing.T) {
 			if test.offDisks > 0 {
 				writers[0] = nil
 			}
-			n, err = erasure.Encode(context.Background(), bytes.NewReader(data[test.offset:]), writers, buffer, erasure.dataBlocks+1)
+			n, err = erasure.Encode(t.Context(), bytes.NewReader(data[test.offset:]), writers, buffer, erasure.dataBlocks+1)
 			closeBitrotWriters(writers)
 			if err != nil && !test.shouldFailQuorum {
 				t.Errorf("Test %d: should pass but failed with: %v", i, err)
@@ -172,17 +172,16 @@ func benchmarkErasureEncode(data, parity, dataDown, parityDown int, size int64, 
 	buffer := make([]byte, blockSizeV2, 2*blockSizeV2)
 	content := make([]byte, size)
 
-	for i := 0; i < dataDown; i++ {
+	for i := range dataDown {
 		disks[i] = OfflineDisk
 	}
 	for i := data; i < data+parityDown; i++ {
 		disks[i] = OfflineDisk
 	}
 
-	b.ResetTimer()
 	b.SetBytes(size)
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		writers := make([]io.Writer, len(disks))
 		for i, disk := range disks {
 			if disk == OfflineDisk {

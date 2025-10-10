@@ -29,6 +29,7 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -228,9 +229,7 @@ func testAPIHeadObjectHandlerWithEncryption(obj ObjectLayer, instanceType, bucke
 		}
 		mapCopy = func(m map[string]string) map[string]string {
 			r := make(map[string]string, len(m))
-			for k, v := range m {
-				r[k] = v
-			}
+			maps.Copy(r, m)
 			return r
 		}
 	)
@@ -246,7 +245,7 @@ func testAPIHeadObjectHandlerWithEncryption(obj ObjectLayer, instanceType, bucke
 		for _, l := range oi.partLengths {
 			sum += l
 		}
-		return
+		return sum
 	}
 
 	// set of inputs for uploading the objects before tests for
@@ -662,9 +661,7 @@ func testAPIGetObjectWithMPHandler(obj ObjectLayer, instanceType, bucketName str
 		}
 		mapCopy = func(m map[string]string) map[string]string {
 			r := make(map[string]string, len(m))
-			for k, v := range m {
-				r[k] = v
-			}
+			maps.Copy(r, m)
 			return r
 		}
 	)
@@ -680,7 +677,7 @@ func testAPIGetObjectWithMPHandler(obj ObjectLayer, instanceType, bucketName str
 		for _, l := range oi.partLengths {
 			sum += l
 		}
-		return
+		return sum
 	}
 
 	// set of inputs for uploading the objects before tests for
@@ -814,7 +811,6 @@ func testAPIGetObjectWithMPHandler(obj ObjectLayer, instanceType, bucketName str
 				caseNumber++
 			}
 		}
-
 	}
 
 	// HTTP request for testing when `objectLayer` is set to `nil`.
@@ -861,9 +857,7 @@ func testAPIGetObjectWithPartNumberHandler(obj ObjectLayer, instanceType, bucket
 		}
 		mapCopy = func(m map[string]string) map[string]string {
 			r := make(map[string]string, len(m))
-			for k, v := range m {
-				r[k] = v
-			}
+			maps.Copy(r, m)
 			return r
 		}
 	)
@@ -903,9 +897,9 @@ func testAPIGetObjectWithPartNumberHandler(obj ObjectLayer, instanceType, bucket
 
 	// SSEC can't be used with compression
 	globalCompressConfigMu.Lock()
-	globalCompressEnabled := globalCompressConfig.Enabled
+	compressEnabled := globalCompressConfig.Enabled
 	globalCompressConfigMu.Unlock()
-	if globalCompressEnabled {
+	if compressEnabled {
 		objectInputs = objectInputs[0:9]
 	}
 
@@ -1567,8 +1561,8 @@ func testAPIPutObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 					}
 				}
 			}
-
 		}
+
 		if testCase.expectedRespStatus == http.StatusOK {
 			buffer := new(bytes.Buffer)
 			// Fetch the object to check whether the content is same as the one uploaded via PutObject.
@@ -1680,7 +1674,7 @@ func testAPIPutObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 // expected.
 func TestAPICopyObjectPartHandlerSanity(t *testing.T) {
 	defer DetectTestLeak(t)()
-	ExecExtendedObjectLayerAPITest(t, testAPICopyObjectPartHandlerSanity, []string{"CopyObjectPart"})
+	ExecExtendedObjectLayerAPITest(t, testAPICopyObjectPartHandlerSanity, []string{"NewMultipart", "CompleteMultipart", "CopyObjectPart"})
 }
 
 func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -1688,7 +1682,6 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 ) {
 	objectName := "test-object"
 	var err error
-	opts := ObjectOptions{}
 	// set of byte data for PutObject.
 	// object has to be created before running tests for Copy Object.
 	// this is required even to assert the copied object,
@@ -1720,18 +1713,26 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 		}
 	}
 
-	// Initiate Multipart upload for testing PutObjectPartHandler.
 	testObject := "testobject"
 
-	// PutObjectPart API HTTP Handler has to be tested in isolation,
-	// that is without any other handler being registered,
-	// That's why NewMultipartUpload is initiated using ObjectLayer.
-	res, err := obj.NewMultipartUpload(context.Background(), bucketName, testObject, opts)
+	// Initiate Multipart upload for testing CopyObjectPartHandler.
+	rec := httptest.NewRecorder()
+	req, err := newTestSignedRequestV4(http.MethodPost, getNewMultipartURL("", bucketName, testObject),
+		0, nil, credentials.AccessKey, credentials.SecretKey, nil)
 	if err != nil {
-		// Failed to create NewMultipartUpload, abort.
-		t.Fatalf("MinIO %s : <ERROR>  %s", instanceType, err)
+		t.Fatalf("Failed to create HTTP request for NewMultipart Request: <ERROR> %v", err)
 	}
-	uploadID := res.UploadID
+	apiRouter.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s:  Expected the response status to be `%d`, but instead found `%d`", instanceType, http.StatusOK, rec.Code)
+	}
+	decoder := xml.NewDecoder(rec.Body)
+	multipartResponse := &InitiateMultipartUploadResponse{}
+	err = decoder.Decode(multipartResponse)
+	if err != nil {
+		t.Fatalf("Error decoding the recorded response Body")
+	}
+	uploadID := multipartResponse.UploadID
 
 	a := 0
 	b := globalMinPartSize
@@ -1772,18 +1773,34 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 		})
 	}
 
-	result, err := obj.CompleteMultipartUpload(context.Background(), bucketName, testObject, uploadID, parts, ObjectOptions{})
-	if err != nil {
-		t.Fatalf("Test: %s complete multipart upload failed: <ERROR> %v", instanceType, err)
+	var completeBytes []byte
+	// Complete multipart upload parts.
+	completeUploads := &CompleteMultipartUpload{
+		Parts: parts,
 	}
-	if result.Size != int64(len(bytesData[0].byteData)) {
-		t.Fatalf("Test: %s expected size not written: expected %d, got %d", instanceType, len(bytesData[0].byteData), result.Size)
+	completeBytes, err = xml.Marshal(completeUploads)
+	if err != nil {
+		t.Fatalf("Error XML encoding of parts: <ERROR> %s.", err)
+	}
+	// Indicating that all parts are uploaded and initiating CompleteMultipartUpload.
+	req, err = newTestSignedRequestV4(http.MethodPost, getCompleteMultipartUploadURL("", bucketName, testObject, uploadID),
+		int64(len(completeBytes)), bytes.NewReader(completeBytes), credentials.AccessKey, credentials.SecretKey, nil)
+	if err != nil {
+		t.Fatalf("Failed to create HTTP request for CompleteMultipartUpload: <ERROR> %v", err)
+	}
+
+	rec = httptest.NewRecorder()
+
+	apiRouter.ServeHTTP(rec, req)
+	// Assert the response code with the expected status.
+	if rec.Code != http.StatusOK {
+		t.Errorf("Test %s: Expected the response status to be `%d`, but instead found `%d`", instanceType, http.StatusOK, rec.Code)
 	}
 
 	var buf bytes.Buffer
 	r, err := obj.GetObjectNInfo(context.Background(), bucketName, testObject, nil, nil, ObjectOptions{})
 	if err != nil {
-		t.Fatalf("Test: %s reading completed file failed: <ERROR> %v", instanceType, err)
+		t.Fatalf("Test %s: reading completed file failed: <ERROR> %v", instanceType, err)
 	}
 	if _, err = io.Copy(&buf, r); err != nil {
 		r.Close()
@@ -1791,7 +1808,14 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 	}
 	r.Close()
 	if !bytes.Equal(buf.Bytes(), bytesData[0].byteData) {
-		t.Fatalf("Test: %s returned data is not expected corruption detected:", instanceType)
+		t.Fatalf("Test %s: returned data is not expected corruption detected:", instanceType)
+	}
+
+	globalCompressConfigMu.Lock()
+	compressEnabled := globalCompressConfig.Enabled
+	globalCompressConfigMu.Unlock()
+	if compressEnabled && !r.ObjInfo.IsCompressed() {
+		t.Errorf("Test %s: object found to be uncompressed though compression was enabled", instanceType)
 	}
 }
 
@@ -2548,6 +2572,13 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			if !bytes.Equal(bytesData[0].byteData, buffers[0].Bytes()) {
 				t.Errorf("Test %d: %s: Data Mismatch: Data fetched back from the copied object doesn't match the original one.", i, instanceType)
 			}
+
+			globalCompressConfigMu.Lock()
+			compressEnabled := globalCompressConfig.Enabled
+			globalCompressConfigMu.Unlock()
+			if compressEnabled && !r.ObjInfo.IsCompressed() {
+				t.Errorf("Test %d %s: object found to be uncompressed though compression was enabled", i, instanceType)
+			}
 		}
 
 		// Verify response of the V2 signed HTTP request.
@@ -2783,7 +2814,7 @@ func testAPINewMultipartHandlerParallel(obj ObjectLayer, instanceType, bucketNam
 
 	objectName := "test-object-new-multipart-parallel"
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		// Initiate NewMultipart upload on the same object 10 times concurrrently.
 		go func() {
@@ -2847,7 +2878,7 @@ func testAPICompleteMultipartHandler(obj ObjectLayer, instanceType, bucketName s
 	// upload IDs collected.
 	var uploadIDs []string
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		// initiate new multipart uploadID.
 		res, err := obj.NewMultipartUpload(context.Background(), bucketName, objectName, opts)
 		if err != nil {
@@ -3215,7 +3246,7 @@ func testAPIAbortMultipartHandler(obj ObjectLayer, instanceType, bucketName stri
 	// upload IDs collected.
 	var uploadIDs []string
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		// initiate new multipart uploadID.
 		res, err := obj.NewMultipartUpload(context.Background(), bucketName, objectName, opts)
 		if err != nil {
@@ -3483,7 +3514,6 @@ func testAPIDeleteObjectHandler(obj ObjectLayer, instanceType, bucketName string
 			t.Errorf("Case %d: MinIO %s: Expected the response status to be `%d`, but instead found `%d`", i+1,
 				instanceType, testCase.expectedRespStatus, recV2.Code)
 		}
-
 	}
 
 	// Test for Anonymous/unsigned http request.
@@ -4161,7 +4191,6 @@ func testAPIListObjectPartsHandler(obj ObjectLayer, instanceType, bucketName str
 
 				// validate the error response.
 				if test.expectedErr != noAPIErr {
-
 					var errBytes []byte
 					// read the response body.
 					errBytes, err = io.ReadAll(rec.Result().Body)

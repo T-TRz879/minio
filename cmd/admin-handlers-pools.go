@@ -61,7 +61,7 @@ func (a adminAPIHandlers) StartDecommission(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if z.IsRebalanceStarted() {
+	if z.IsRebalanceStarted(ctx) {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminRebalanceAlreadyStarted), r.URL)
 		return
 	}
@@ -258,8 +258,8 @@ func (a adminAPIHandlers) RebalanceStart(w http.ResponseWriter, r *http.Request)
 	// concurrent rebalance-start commands.
 	if ep := globalEndpoints[0].Endpoints[0]; !ep.IsLocal {
 		for nodeIdx, proxyEp := range globalProxyEndpoints {
-			if proxyEp.Endpoint.Host == ep.Host {
-				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
+			if proxyEp.Host == ep.Host {
+				if proxied, success := proxyRequestByNodeIndex(ctx, w, r, nodeIdx, false); proxied && success {
 					return
 				}
 			}
@@ -277,7 +277,7 @@ func (a adminAPIHandlers) RebalanceStart(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if pools.IsRebalanceStarted() {
+	if pools.IsRebalanceStarted(ctx) {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminRebalanceAlreadyStarted), r.URL)
 		return
 	}
@@ -329,8 +329,8 @@ func (a adminAPIHandlers) RebalanceStatus(w http.ResponseWriter, r *http.Request
 	// pools may temporarily have out of date info on the others.
 	if ep := globalEndpoints[0].Endpoints[0]; !ep.IsLocal {
 		for nodeIdx, proxyEp := range globalProxyEndpoints {
-			if proxyEp.Endpoint.Host == ep.Host {
-				if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
+			if proxyEp.Host == ep.Host {
+				if proxied, success := proxyRequestByNodeIndex(ctx, w, r, nodeIdx, false); proxied && success {
 					return
 				}
 			}
@@ -380,14 +380,14 @@ func (a adminAPIHandlers) RebalanceStop(w http.ResponseWriter, r *http.Request) 
 func proxyDecommissionRequest(ctx context.Context, defaultEndPoint Endpoint, w http.ResponseWriter, r *http.Request) (proxy bool) {
 	host := env.Get("_MINIO_DECOM_ENDPOINT_HOST", defaultEndPoint.Host)
 	if host == "" {
-		return
+		return proxy
 	}
 	for nodeIdx, proxyEp := range globalProxyEndpoints {
-		if proxyEp.Endpoint.Host == host && !proxyEp.IsLocal {
-			if proxyRequestByNodeIndex(ctx, w, r, nodeIdx) {
+		if proxyEp.Host == host && !proxyEp.IsLocal {
+			if proxied, success := proxyRequestByNodeIndex(ctx, w, r, nodeIdx, false); proxied && success {
 				return true
 			}
 		}
 	}
-	return
+	return proxy
 }

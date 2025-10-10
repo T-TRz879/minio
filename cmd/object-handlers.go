@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
@@ -408,7 +409,7 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 			perr   error
 		)
 
-		if (isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrReadQuorum(err)) && !(gr != nil && gr.ObjInfo.DeleteMarker) {
+		if (isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrReadQuorum(err)) && (gr == nil || !gr.ObjInfo.DeleteMarker) {
 			proxytgts := getProxyTargets(ctx, bucket, object, opts)
 			if !proxytgts.Empty() {
 				globalReplicationStats.Load().incProxy(bucket, getObjectAPI, false)
@@ -521,7 +522,8 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 
 	if r.Header.Get(xhttp.AmzChecksumMode) == "ENABLED" && rs == nil {
 		// AWS S3 silently drops checksums on range requests.
-		hash.AddChecksumHeader(w, objInfo.decryptChecksums(opts.PartNumber, r.Header))
+		cs, _ := objInfo.decryptChecksums(opts.PartNumber, r.Header)
+		hash.AddChecksumHeader(w, cs)
 	}
 
 	if err = setObjectHeaders(ctx, w, objInfo, rs, opts); err != nil {
@@ -536,8 +538,7 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 
 	setHeadGetRespHeaders(w, r.Form)
 
-	var iw io.Writer
-	iw = w
+	var iw io.Writer = w
 
 	statusCodeWritten := false
 	httpWriter := xioutil.WriteOnClose(iw)
@@ -632,14 +633,16 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 	w.Header().Del(xhttp.ContentType)
 
 	if _, ok := opts.ObjectAttributes[xhttp.Checksum]; ok {
-		chkSums := objInfo.decryptChecksums(0, r.Header)
+		chkSums, _ := objInfo.decryptChecksums(0, r.Header)
 		// AWS does not appear to append part number on this API call.
 		if len(chkSums) > 0 {
 			OA.Checksum = &objectAttributesChecksum{
-				ChecksumCRC32:  strings.Split(chkSums["CRC32"], "-")[0],
-				ChecksumCRC32C: strings.Split(chkSums["CRC32C"], "-")[0],
-				ChecksumSHA1:   strings.Split(chkSums["SHA1"], "-")[0],
-				ChecksumSHA256: strings.Split(chkSums["SHA256"], "-")[0],
+				ChecksumCRC32:     strings.Split(chkSums["CRC32"], "-")[0],
+				ChecksumCRC32C:    strings.Split(chkSums["CRC32C"], "-")[0],
+				ChecksumSHA1:      strings.Split(chkSums["SHA1"], "-")[0],
+				ChecksumSHA256:    strings.Split(chkSums["SHA256"], "-")[0],
+				ChecksumCRC64NVME: strings.Split(chkSums["CRC64NVME"], "-")[0],
+				ChecksumType:      chkSums[xhttp.AmzChecksumType],
 			}
 		}
 	}
@@ -678,12 +681,13 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 
 				OA.ObjectParts.NextPartNumberMarker = v.Number
 				OA.ObjectParts.Parts = append(OA.ObjectParts.Parts, &objectAttributesPart{
-					ChecksumSHA1:   objInfo.Parts[i].Checksums["SHA1"],
-					ChecksumSHA256: objInfo.Parts[i].Checksums["SHA256"],
-					ChecksumCRC32:  objInfo.Parts[i].Checksums["CRC32"],
-					ChecksumCRC32C: objInfo.Parts[i].Checksums["CRC32C"],
-					PartNumber:     objInfo.Parts[i].Number,
-					Size:           objInfo.Parts[i].Size,
+					ChecksumSHA1:      objInfo.Parts[i].Checksums["SHA1"],
+					ChecksumSHA256:    objInfo.Parts[i].Checksums["SHA256"],
+					ChecksumCRC32:     objInfo.Parts[i].Checksums["CRC32"],
+					ChecksumCRC32C:    objInfo.Parts[i].Checksums["CRC32C"],
+					ChecksumCRC64NVME: objInfo.Parts[i].Checksums["CRC64NVME"],
+					PartNumber:        objInfo.Parts[i].Number,
+					Size:              objInfo.Parts[i].Size,
 				})
 			}
 		}
@@ -704,8 +708,6 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 		UserAgent:    r.UserAgent(),
 		Host:         handlers.GetSourceIP(r),
 	})
-
-	return
 }
 
 // GetObjectHandler - GET Object
@@ -943,7 +945,8 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 
 	if r.Header.Get(xhttp.AmzChecksumMode) == "ENABLED" && rs == nil {
 		// AWS S3 silently drops checksums on range requests.
-		hash.AddChecksumHeader(w, objInfo.decryptChecksums(opts.PartNumber, r.Header))
+		cs, _ := objInfo.decryptChecksums(opts.PartNumber, r.Header)
+		hash.AddChecksumHeader(w, cs)
 	}
 
 	// Set standard object headers.
@@ -1191,6 +1194,9 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Sanitize the source object name similar to NewMultipart and PutObject API
+	srcObject = trimLeadingSlash(srcObject)
+
 	if vid != "" && vid != nullVersionID {
 		_, err := uuid.Parse(vid)
 		if err != nil {
@@ -1333,16 +1339,12 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// Check if either the source is encrypted or the destination will be encrypted.
-	objectEncryption := crypto.Requested(r.Header)
-	objectEncryption = objectEncryption || crypto.IsSourceEncrypted(srcInfo.UserDefined)
-
 	var compressMetadata map[string]string
 	// No need to compress for remote etcd calls
 	// Pass the decompressed stream to such calls.
 	isDstCompressed := isCompressible(r.Header, dstObject) &&
 		length > minCompressibleSize &&
-		!isRemoteCopyRequired(ctx, srcBucket, dstBucket, objectAPI) && !objectEncryption
+		!isRemoteCopyRequired(ctx, srcBucket, dstBucket, objectAPI)
 	if isDstCompressed {
 		compressMetadata = make(map[string]string, 2)
 		// Preserving the compression metadata.
@@ -1465,6 +1467,46 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			targetSize, _ = srcInfo.DecryptedSize()
 		}
 
+		// Client can request that a different type of checksum is computed server-side for the
+		// destination object using the x-amz-checksum-algorithm header.
+		headerChecksumType := hash.NewChecksumHeader(r.Header)
+		if headerChecksumType.IsSet() {
+			dstOpts.WantServerSideChecksumType = headerChecksumType.Base()
+			srcInfo.Reader.AddServerSideChecksumHasher(headerChecksumType)
+			dstOpts.WantChecksum = nil
+		} else {
+			// Check the source object for checksum.
+			// If Checksum is not encrypted, decryptChecksum will be a no-op and return
+			// the already unencrypted value.
+			srcChecksumDecrypted, err := srcInfo.decryptChecksum(r.Header)
+			if err != nil {
+				encLogOnceIf(GlobalContext,
+					fmt.Errorf("Unable to decryptChecksum for object: %s/%s, error: %w", srcBucket, srcObject, err),
+					"copy-object-decrypt-checksums-"+srcBucket+srcObject)
+			}
+
+			// The source object has a checksum set, we need the destination to have one too.
+			if srcChecksumDecrypted != nil {
+				dstOpts.WantChecksum = hash.ChecksumFromBytes(srcChecksumDecrypted)
+
+				// When an object is being copied from a source that is multipart, the destination will
+				// no longer be multipart, and thus the checksum becomes full-object instead. Since
+				// the CopyObject API does not require that the caller send us this final checksum, we need
+				// to compute it server-side, with the same type as the source object.
+				if dstOpts.WantChecksum != nil && dstOpts.WantChecksum.Type.IsMultipartComposite() {
+					dstOpts.WantServerSideChecksumType = dstOpts.WantChecksum.Type.Base()
+					srcInfo.Reader.AddServerSideChecksumHasher(dstOpts.WantServerSideChecksumType)
+					dstOpts.WantChecksum = nil
+				}
+			} else {
+				// S3: All copied objects without checksums and specified destination checksum algorithms
+				// automatically gain a CRC-64NVME checksum algorithm.
+				dstOpts.WantServerSideChecksumType = hash.ChecksumCRC64NVME
+				srcInfo.Reader.AddServerSideChecksumHasher(dstOpts.WantServerSideChecksumType)
+				dstOpts.WantChecksum = nil
+			}
+		}
+
 		if isTargetEncrypted {
 			var encReader io.Reader
 			kind, _ := crypto.IsRequested(r.Header)
@@ -1498,6 +1540,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			if dstOpts.IndexCB != nil {
 				dstOpts.IndexCB = compressionIndexEncrypter(objEncKey, dstOpts.IndexCB)
 			}
+			dstOpts.EncryptFn = metadataEncrypter(objEncKey)
 		}
 	}
 
@@ -1526,7 +1569,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			if !srcTimestamp.IsZero() {
 				ondiskTimestamp, err := time.Parse(time.RFC3339Nano, lastTaggingTimestamp)
 				// update tagging metadata only if replica  timestamp is newer than what's on disk
-				if err != nil || (err == nil && ondiskTimestamp.Before(srcTimestamp)) {
+				if err != nil || (err == nil && !ondiskTimestamp.After(srcTimestamp)) {
 					srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = srcTimestamp.UTC().Format(time.RFC3339Nano)
 					srcInfo.UserDefined[xhttp.AmzObjectTagging] = objTags
 				}
@@ -1535,7 +1578,6 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			srcInfo.UserDefined[xhttp.AmzObjectTagging] = objTags
 			srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = UTCNow().Format(time.RFC3339Nano)
 		}
-
 	}
 
 	srcInfo.UserDefined = filterReplicationStatusMetadata(srcInfo.UserDefined)
@@ -1601,15 +1643,11 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		srcInfo.UserDefined[ReservedMetadataPrefixLower+ReplicationTimestamp] = UTCNow().Format(time.RFC3339Nano)
 	}
 	// Store the preserved compression metadata.
-	for k, v := range compressMetadata {
-		srcInfo.UserDefined[k] = v
-	}
+	maps.Copy(srcInfo.UserDefined, compressMetadata)
 
 	// We need to preserve the encryption headers set in EncryptRequest,
 	// so we do not want to override them, copy them instead.
-	for k, v := range encMetadata {
-		srcInfo.UserDefined[k] = v
-	}
+	maps.Copy(srcInfo.UserDefined, encMetadata)
 
 	// Ensure that metadata does not contain sensitive information
 	crypto.RemoveSensitiveEntries(srcInfo.UserDefined)
@@ -1625,13 +1663,22 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	// if encryption is enabled we do not need explicit "REPLACE" metadata to
 	// be enabled as well - this is to allow for key-rotation.
 	if !isDirectiveReplace(r.Header.Get(xhttp.AmzMetadataDirective)) && !isDirectiveReplace(r.Header.Get(xhttp.AmzTagDirective)) &&
-		srcInfo.metadataOnly && srcOpts.VersionID == "" && !objectEncryption {
+		srcInfo.metadataOnly && srcOpts.VersionID == "" &&
+		!crypto.Requested(r.Header) &&
+		!crypto.IsSourceEncrypted(srcInfo.UserDefined) {
 		// If x-amz-metadata-directive is not set to REPLACE then we need
 		// to error out if source and destination are same.
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidCopyDest), r.URL)
 		return
 	}
 
+	// After we've checked for an invalid copy (above), if a server-side checksum type
+	// is requested, we need to read the source to recompute the checksum.
+	if dstOpts.WantServerSideChecksumType.IsSet() {
+		srcInfo.metadataOnly = false
+	}
+
+	// Federation only.
 	remoteCallRequired := isRemoteCopyRequired(ctx, srcBucket, dstBucket, objectAPI)
 
 	var objInfo ObjectInfo
@@ -1849,7 +1896,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		}
 	case authTypeStreamingUnsignedTrailer:
 		// Initialize stream chunked reader with optional trailers.
-		rd, s3Err = newUnsignedV4ChunkedReader(r, true)
+		rd, s3Err = newUnsignedV4ChunkedReader(r, true, r.Header.Get(xhttp.Authorization) != "")
 		if s3Err != ErrNone {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 			return
@@ -1900,6 +1947,13 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	var reader io.Reader
 	reader = rd
 
+	var opts ObjectOptions
+	opts, err = putOptsFromReq(ctx, r, bucket, object, metadata)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
 	actualSize := size
 	var idxCb func() []byte
 	if isCompressible(r.Header, object) && size > minCompressibleSize {
@@ -1916,6 +1970,8 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidChecksum), r.URL)
 			return
 		}
+		opts.WantChecksum = actualReader.Checksum()
+
 		// Set compression metrics.
 		var s2c io.ReadCloser
 		wantEncryption := crypto.Requested(r.Header)
@@ -1946,22 +2002,21 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
-	if err := hashReader.AddChecksum(r, size < 0); err != nil {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidChecksum), r.URL)
-		return
+	if size >= 0 {
+		if err := hashReader.AddChecksum(r, false); err != nil {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidChecksum), r.URL)
+			return
+		}
+		opts.WantChecksum = hashReader.Checksum()
 	}
 
 	rawReader := hashReader
 	pReader := NewPutObjReader(rawReader)
-
-	var opts ObjectOptions
-	opts, err = putOptsFromReq(ctx, r, bucket, object, metadata)
-	if err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
 	opts.IndexCB = idxCb
 
+	if r.Header.Get(xhttp.IfMatch) != "" {
+		opts.HasIfMatch = true
+	}
 	if opts.PreserveETag != "" ||
 		r.Header.Get(xhttp.IfMatch) != "" ||
 		r.Header.Get(xhttp.IfNoneMatch) != "" {
@@ -2220,8 +2275,15 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		putObject = objectAPI.PutObject
 	)
 
-	// Check if put is allowed
-	if s3Err = isPutActionAllowed(ctx, rAuthType, bucket, object, r, policy.PutObjectAction); s3Err != ErrNone {
+	var opts untarOptions
+	opts.ignoreDirs = strings.EqualFold(r.Header.Get(xhttp.MinIOSnowballIgnoreDirs), "true")
+	opts.ignoreErrs = strings.EqualFold(r.Header.Get(xhttp.MinIOSnowballIgnoreErrors), "true")
+	opts.prefixAll = r.Header.Get(xhttp.MinIOSnowballPrefix)
+	if opts.prefixAll != "" {
+		opts.prefixAll = trimLeadingSlash(pathJoin(opts.prefixAll, slashSeparator))
+	}
+	// Check if put is allow for specified prefix.
+	if s3Err = isPutActionAllowed(ctx, rAuthType, bucket, opts.prefixAll, r, policy.PutObjectAction); s3Err != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 		return
 	}
@@ -2289,7 +2351,10 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 
 	putObjectTar := func(reader io.Reader, info os.FileInfo, object string) error {
 		size := info.Size()
-
+		if s3Err = isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.PutObjectAction); s3Err != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+			return errors.New(errorCodes.ToAPIErr(s3Err).Code)
+		}
 		metadata := map[string]string{
 			xhttp.AmzStorageClass: sc, // save same storage-class as incoming stream.
 		}
@@ -2325,7 +2390,7 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 
 		if r.Header.Get(xhttp.AmzBucketReplicationStatus) == replication.Replica.String() {
 			if s3Err = isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.ReplicateObjectAction); s3Err != ErrNone {
-				return err
+				return errors.New(errorCodes.ToAPIErr(s3Err).Code)
 			}
 			metadata[ReservedMetadataPrefixLower+ReplicaStatus] = replication.Replica.String()
 			metadata[ReservedMetadataPrefixLower+ReplicaTimestamp] = UTCNow().Format(time.RFC3339Nano)
@@ -2343,8 +2408,8 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 				if k == "minio.versionId" {
 					continue
 				}
-				if strings.HasPrefix(k, "minio.metadata.") {
-					k = strings.TrimPrefix(k, "minio.metadata.")
+				if after, ok0 := strings.CutPrefix(k, "minio.metadata."); ok0 {
+					k = after
 					hdrs.Set(k, v)
 				}
 			}
@@ -2352,9 +2417,7 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 			if err != nil {
 				return err
 			}
-			for k, v := range m {
-				metadata[k] = v
-			}
+			maps.Copy(metadata, m)
 		} else {
 			versionID = r.Form.Get(xhttp.VersionID)
 			hdrs = r.Header
@@ -2389,7 +2452,6 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		if dsc := mustReplicate(ctx, bucket, object, getMustReplicateOptions(metadata, "", "", replication.ObjectReplicationType, opts)); dsc.ReplicateAny() {
 			metadata[ReservedMetadataPrefixLower+ReplicationTimestamp] = UTCNow().Format(time.RFC3339Nano)
 			metadata[ReservedMetadataPrefixLower+ReplicationStatus] = dsc.PendingStatus()
-
 		}
 
 		var objectEncryptionKey crypto.ObjectKey
@@ -2470,14 +2532,6 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		}
 
 		return nil
-	}
-
-	var opts untarOptions
-	opts.ignoreDirs = strings.EqualFold(r.Header.Get(xhttp.MinIOSnowballIgnoreDirs), "true")
-	opts.ignoreErrs = strings.EqualFold(r.Header.Get(xhttp.MinIOSnowballIgnoreErrors), "true")
-	opts.prefixAll = r.Header.Get(xhttp.MinIOSnowballPrefix)
-	if opts.prefixAll != "" {
-		opts.prefixAll = trimLeadingSlash(pathJoin(opts.prefixAll, slashSeparator))
 	}
 
 	if err = untar(ctx, hreader, putObjectTar, opts); err != nil {
@@ -2608,7 +2662,7 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 				return err
 			}
 		}
-		return
+		return err
 	})
 
 	deleteObject := objectAPI.DeleteObject
@@ -2665,7 +2719,7 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		Host:         handlers.GetSourceIP(r),
 	})
 
-	if objInfo.ReplicationStatus == replication.Pending || objInfo.VersionPurgeStatus == Pending {
+	if objInfo.ReplicationStatus == replication.Pending || objInfo.VersionPurgeStatus == replication.VersionPurgePending {
 		dmVersionID := ""
 		versionID := ""
 		if objInfo.DeleteMarker {
@@ -2724,7 +2778,7 @@ func (api objectAPIHandlers) PutObjectLegalHoldHandler(w http.ResponseWriter, r 
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
-	if !hasContentMD5(r.Header) {
+	if !validateLengthAndChecksum(r) {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingContentMD5), r.URL)
 		return
 	}
@@ -2734,7 +2788,7 @@ func (api objectAPIHandlers) PutObjectLegalHoldHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	legalHold, err := objectlock.ParseObjectLegalHold(io.LimitReader(r.Body, r.ContentLength))
+	legalHold, err := objectlock.ParseObjectLegalHold(r.Body)
 	if err != nil {
 		apiErr := errorCodes.ToAPIErr(ErrMalformedXML)
 		apiErr.Description = err.Error()
@@ -2871,9 +2925,9 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	cred, owner, s3Err := validateSignature(getRequestAuthType(r), r)
-	if s3Err != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+	// Check permissions to perform this object retention operation
+	if s3Error := authenticateRequest(ctx, r, policy.PutObjectRetentionAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
@@ -2882,7 +2936,7 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	if !hasContentMD5(r.Header) {
+	if !validateLengthAndChecksum(r) {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingContentMD5), r.URL)
 		return
 	}
@@ -2900,6 +2954,9 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		return
 	}
 
+	reqInfo := logger.GetReqInfo(ctx)
+	reqInfo.SetTags("retention", objRetention.String())
+
 	opts, err := getOpts(ctx, r, bucket, object)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -2910,7 +2967,7 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		MTime:     opts.MTime,
 		VersionID: opts.VersionID,
 		EvalMetadataFn: func(oi *ObjectInfo, gerr error) (dsc ReplicateDecision, err error) {
-			if err := enforceRetentionBypassForPut(ctx, r, *oi, objRetention, cred, owner); err != nil {
+			if err := enforceRetentionBypassForPut(ctx, r, *oi, objRetention, reqInfo.Cred, reqInfo.Owner); err != nil {
 				return dsc, err
 			}
 			if objRetention.Mode.Valid() {

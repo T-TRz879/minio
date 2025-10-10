@@ -188,7 +188,6 @@ func testGetBucketLocationHandler(obj ObjectLayer, instanceType, bucketName stri
 		if errorResponse.Code != testCase.errorResponse.Code {
 			t.Errorf("Test %d: %s: Expected the error code to be `%s`, but instead found `%s`", i+1, instanceType, testCase.errorResponse.Code, errorResponse.Code)
 		}
-
 	}
 
 	// Test for Anonymous/unsigned http request.
@@ -290,7 +289,6 @@ func testHeadBucketHandler(obj ObjectLayer, instanceType, bucketName string, api
 		if recV2.Code != testCase.expectedRespStatus {
 			t.Errorf("Test %d: %s: Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, recV2.Code)
 		}
-
 	}
 
 	// Test for Anonymous/unsigned http request.
@@ -659,7 +657,7 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 
 	sha256sum := ""
 	var objectNames []string
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		contentBytes := []byte("hello")
 		objectName := "test-object-" + strconv.Itoa(i)
 		if i == 0 {
@@ -689,7 +687,7 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 
 	// The following block will create a bucket policy with delete object to 'public/*'. This is
 	// to test a mixed response of a successful & failure while deleting objects in a single request
-	policyBytes := []byte(fmt.Sprintf(`{"Id": "Policy1637752602639", "Version": "2012-10-17", "Statement": [{"Sid": "Stmt1637752600730", "Action": "s3:DeleteObject", "Effect": "Allow", "Resource": "arn:aws:s3:::%s/public/*", "Principal": "*"}]}`, bucketName))
+	policyBytes := fmt.Appendf(nil, `{"Id": "Policy1637752602639", "Version": "2012-10-17", "Statement": [{"Sid": "Stmt1637752600730", "Action": "s3:DeleteObject", "Effect": "Allow", "Resource": "arn:aws:s3:::%s/public/*", "Principal": "*"}]}`, bucketName)
 	rec := httptest.NewRecorder()
 	req, err := newTestSignedRequestV4(http.MethodPut, getPutPolicyURL("", bucketName), int64(len(policyBytes)), bytes.NewReader(policyBytes),
 		credentials.AccessKey, credentials.SecretKey, nil)

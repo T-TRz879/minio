@@ -40,13 +40,12 @@ func BenchmarkCrcHash(b *testing.B) {
 		{1024},
 	}
 	for _, testCase := range cases {
-		testCase := testCase
 		key := randString(testCase.key)
 		b.Run("", func(b *testing.B) {
 			b.SetBytes(1024)
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				crcHashMod(key, 16)
 			}
 		})
@@ -65,13 +64,12 @@ func BenchmarkSipHash(b *testing.B) {
 		{1024},
 	}
 	for _, testCase := range cases {
-		testCase := testCase
 		key := randString(testCase.key)
 		b.Run("", func(b *testing.B) {
 			b.SetBytes(1024)
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				sipHashMod(key, 16, testUUID)
 			}
 		})
@@ -159,12 +157,12 @@ func TestCrcHashMod(t *testing.T) {
 // TestNewErasure - tests initialization of all input disks
 // and constructs a valid `Erasure` object
 func TestNewErasureSets(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	nDisks := 16 // Maximum disks.
 	var erasureDisks []string
-	for i := 0; i < nDisks; i++ {
+	for range nDisks {
 		// Do not attempt to create this path, the test validates
 		// so that newErasureSets initializes non existing paths
 		// and successfully returns initialized object layer.

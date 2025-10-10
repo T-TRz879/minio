@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"runtime"
 	"strconv"
@@ -74,14 +75,14 @@ func TestSingleRoundtrip(t *testing.T) {
 
 	// local to remote
 	remoteConn := local.Connection(remoteHost)
-	remoteConn.WaitForConnect(context.Background())
+	remoteConn.WaitForConnect(t.Context())
 	defer testlogger.T.SetErrorTB(t)()
 
 	t.Run("localToRemote", func(t *testing.T) {
 		const testPayload = "Hello Grid World!"
 
 		start := time.Now()
-		resp, err := remoteConn.Request(context.Background(), handlerTest, []byte(testPayload))
+		resp, err := remoteConn.Request(t.Context(), handlerTest, []byte(testPayload))
 		errFatal(err)
 		if string(resp) != testPayload {
 			t.Errorf("want %q, got %q", testPayload, string(resp))
@@ -92,7 +93,7 @@ func TestSingleRoundtrip(t *testing.T) {
 	t.Run("localToRemoteErr", func(t *testing.T) {
 		const testPayload = "Hello Grid World!"
 		start := time.Now()
-		resp, err := remoteConn.Request(context.Background(), handlerTest2, []byte(testPayload))
+		resp, err := remoteConn.Request(t.Context(), handlerTest2, []byte(testPayload))
 		t.Log("Roundtrip:", time.Since(start))
 		if len(resp) != 0 {
 			t.Errorf("want nil, got %q", string(resp))
@@ -107,7 +108,7 @@ func TestSingleRoundtrip(t *testing.T) {
 		testPayload := bytes.Repeat([]byte("?"), 1<<20)
 
 		start := time.Now()
-		resp, err := remoteConn.Request(context.Background(), handlerTest, testPayload)
+		resp, err := remoteConn.Request(t.Context(), handlerTest, testPayload)
 		errFatal(err)
 		if string(resp) != string(testPayload) {
 			t.Errorf("want %q, got %q", testPayload, string(resp))
@@ -119,7 +120,7 @@ func TestSingleRoundtrip(t *testing.T) {
 		testPayload := bytes.Repeat([]byte("!"), 1<<10)
 
 		start := time.Now()
-		resp, err := remoteConn.Request(context.Background(), handlerTest2, testPayload)
+		resp, err := remoteConn.Request(t.Context(), handlerTest2, testPayload)
 		if len(resp) != 0 {
 			t.Errorf("want nil, got %q", string(resp))
 		}
@@ -159,19 +160,19 @@ func TestSingleRoundtripNotReady(t *testing.T) {
 
 	// local to remote
 	remoteConn := local.Connection(remoteHost)
-	remoteConn.WaitForConnect(context.Background())
+	remoteConn.WaitForConnect(t.Context())
 	defer testlogger.T.SetErrorTB(t)()
 
 	t.Run("localToRemote", func(t *testing.T) {
 		const testPayload = "Hello Grid World!"
 		// Single requests should have remote errors.
-		_, err := remoteConn.Request(context.Background(), handlerTest, []byte(testPayload))
+		_, err := remoteConn.Request(t.Context(), handlerTest, []byte(testPayload))
 		if _, ok := err.(*RemoteErr); !ok {
 			t.Fatalf("Unexpected error: %v, %T", err, err)
 		}
 		// Streams should not be able to set up until registered.
 		// Thus, the error is a local error.
-		_, err = remoteConn.NewStream(context.Background(), handlerTest, []byte(testPayload))
+		_, err = remoteConn.NewStream(t.Context(), handlerTest, []byte(testPayload))
 		if !errors.Is(err, ErrUnknownHandler) {
 			t.Fatalf("Unexpected error: %v, %T", err, err)
 		}
@@ -226,7 +227,7 @@ func TestSingleRoundtripGenerics(t *testing.T) {
 
 	start := time.Now()
 	req := testRequest{Num: 1, String: testPayload}
-	resp, err := h1.Call(context.Background(), remoteConn, &req)
+	resp, err := h1.Call(t.Context(), remoteConn, &req)
 	errFatal(err)
 	if resp.OrgString != testPayload {
 		t.Errorf("want %q, got %q", testPayload, resp.OrgString)
@@ -235,7 +236,7 @@ func TestSingleRoundtripGenerics(t *testing.T) {
 	h1.PutResponse(resp)
 
 	start = time.Now()
-	resp, err = h2.Call(context.Background(), remoteConn, &testRequest{Num: 1, String: testPayload})
+	resp, err = h2.Call(t.Context(), remoteConn, &testRequest{Num: 1, String: testPayload})
 	t.Log("Roundtrip:", time.Since(start))
 	if err != RemoteErr(testPayload) {
 		t.Errorf("want error %v(%T), got %v(%T)", RemoteErr(testPayload), RemoteErr(testPayload), err, err)
@@ -266,9 +267,7 @@ func TestSingleRoundtripGenericsRecycle(t *testing.T) {
 	// Handles incoming requests, returns a response
 	handler1 := func(req *MSS) (resp *MSS, err *RemoteErr) {
 		resp = h1.NewResponse()
-		for k, v := range *req {
-			(*resp)[k] = v
-		}
+		maps.Copy((*resp), *req)
 		return resp, nil
 	}
 	// Return error
@@ -290,7 +289,7 @@ func TestSingleRoundtripGenericsRecycle(t *testing.T) {
 
 	start := time.Now()
 	req := NewMSSWith(map[string]string{"test": testPayload})
-	resp, err := h1.Call(context.Background(), remoteConn, req)
+	resp, err := h1.Call(t.Context(), remoteConn, req)
 	errFatal(err)
 	if resp.Get("test") != testPayload {
 		t.Errorf("want %q, got %q", testPayload, resp.Get("test"))
@@ -299,7 +298,7 @@ func TestSingleRoundtripGenericsRecycle(t *testing.T) {
 	h1.PutResponse(resp)
 
 	start = time.Now()
-	resp, err = h2.Call(context.Background(), remoteConn, NewMSSWith(map[string]string{"err": testPayload}))
+	resp, err = h2.Call(t.Context(), remoteConn, NewMSSWith(map[string]string{"err": testPayload}))
 	t.Log("Roundtrip:", time.Since(start))
 	if err != RemoteErr(testPayload) {
 		t.Errorf("want error %v(%T), got %v(%T)", RemoteErr(testPayload), RemoteErr(testPayload), err, err)
@@ -479,7 +478,7 @@ func testStreamRoundtrip(t *testing.T, local, remote *Manager) {
 	const testPayload = "Hello Grid World!"
 
 	start := time.Now()
-	stream, err := remoteConn.NewStream(context.Background(), handlerTest, []byte(testPayload))
+	stream, err := remoteConn.NewStream(t.Context(), handlerTest, []byte(testPayload))
 	errFatal(err)
 	var n int
 	stream.Requests <- []byte(strconv.Itoa(n))
@@ -544,7 +543,7 @@ func testStreamCancel(t *testing.T, local, remote *Manager) {
 		remoteConn := local.Connection(remoteHost)
 		const testPayload = "Hello Grid World!"
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		st, err := remoteConn.NewStream(ctx, handler, []byte(testPayload))
 		errFatal(err)
 		clientCanceled := make(chan time.Time, 1)
@@ -659,7 +658,7 @@ func testStreamDeadline(t *testing.T, local, remote *Manager) {
 		remoteConn := local.Connection(remoteHost)
 		const testPayload = "Hello Grid World!"
 
-		ctx, cancel := context.WithTimeout(context.Background(), wantDL)
+		ctx, cancel := context.WithTimeout(t.Context(), wantDL)
 		defer cancel()
 		st, err := remoteConn.NewStream(ctx, handler, []byte(testPayload))
 		errFatal(err)
@@ -708,7 +707,7 @@ func testServerOutCongestion(t *testing.T, local, remote *Manager) {
 			Handle: func(ctx context.Context, payload []byte, request <-chan []byte, resp chan<- []byte) *RemoteErr {
 				// Send many responses.
 				// Test that this doesn't block.
-				for i := byte(0); i < 100; i++ {
+				for i := range byte(100) {
 					select {
 					case resp <- []byte{i}:
 					// ok
@@ -735,7 +734,7 @@ func testServerOutCongestion(t *testing.T, local, remote *Manager) {
 	remoteConn := local.Connection(remoteHost)
 	const testPayload = "Hello Grid World!"
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	st, err := remoteConn.NewStream(ctx, handlerTest, []byte(testPayload))
 	errFatal(err)
@@ -744,7 +743,7 @@ func testServerOutCongestion(t *testing.T, local, remote *Manager) {
 	<-serverSent
 
 	// Now do 100 other requests to ensure that the server doesn't block.
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		_, err := remoteConn.Request(ctx, handlerTest2, []byte(testPayload))
 		errFatal(err)
 	}
@@ -813,20 +812,20 @@ func testServerInCongestion(t *testing.T, local, remote *Manager) {
 	remoteConn := local.Connection(remoteHost)
 	const testPayload = "Hello Grid World!"
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	st, err := remoteConn.NewStream(ctx, handlerTest, []byte(testPayload))
 	errFatal(err)
 
 	// Start sending requests.
 	go func() {
-		for i := byte(0); i < 100; i++ {
+		for i := range byte(100) {
 			st.Requests <- []byte{i}
 		}
 		close(st.Requests)
 	}()
 	// Now do 100 other requests to ensure that the server doesn't block.
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		_, err := remoteConn.Request(ctx, handlerTest2, []byte(testPayload))
 		errFatal(err)
 	}
@@ -893,11 +892,11 @@ func testGenericsStreamRoundtrip(t *testing.T, local, remote *Manager) {
 	const testPayload = "Hello Grid World!"
 
 	start := time.Now()
-	stream, err := handler.Call(context.Background(), remoteConn, &testRequest{Num: 1, String: testPayload})
+	stream, err := handler.Call(t.Context(), remoteConn, &testRequest{Num: 1, String: testPayload})
 	errFatal(err)
 	go func() {
 		defer close(stream.Requests)
-		for i := 0; i < payloads; i++ {
+		for i := range payloads {
 			// t.Log("sending new client request")
 			stream.Requests <- &testRequest{Num: i, String: testPayload}
 		}
@@ -970,11 +969,11 @@ func testGenericsStreamRoundtripSubroute(t *testing.T, local, remote *Manager) {
 	remoteSub := remoteConn.Subroute(strings.Join([]string{"subroute", "1"}, "/"))
 
 	start := time.Now()
-	stream, err := handler.Call(context.Background(), remoteSub, &testRequest{Num: 1, String: testPayload})
+	stream, err := handler.Call(t.Context(), remoteSub, &testRequest{Num: 1, String: testPayload})
 	errFatal(err)
 	go func() {
 		defer close(stream.Requests)
-		for i := 0; i < payloads; i++ {
+		for i := range payloads {
 			// t.Log("sending new client request")
 			stream.Requests <- &testRequest{Num: i, String: testPayload}
 		}
@@ -1019,7 +1018,7 @@ func testServerStreamResponseBlocked(t *testing.T, local, remote *Manager) {
 			Handle: func(ctx context.Context, payload []byte, _ <-chan []byte, resp chan<- []byte) *RemoteErr {
 				// Send many responses.
 				// Test that this doesn't block.
-				for i := byte(0); i < 100; i++ {
+				for i := range byte(100) {
 					select {
 					case resp <- []byte{i}:
 					// ok
@@ -1043,7 +1042,7 @@ func testServerStreamResponseBlocked(t *testing.T, local, remote *Manager) {
 	remoteConn := local.Connection(remoteHost)
 	const testPayload = "Hello Grid World!"
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 
 	st, err := remoteConn.NewStream(ctx, handlerTest, []byte(testPayload))
 	errFatal(err)
@@ -1125,7 +1124,7 @@ func testServerStreamNoPing(t *testing.T, local, remote *Manager, inCap int) {
 	remoteConn.debugMsg(debugSetClientPingDuration, 100*time.Millisecond)
 	defer remoteConn.debugMsg(debugSetClientPingDuration, clientPingInterval)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	st, err := remoteConn.NewStream(ctx, handlerTest, []byte(testPayload))
 	errFatal(err)
@@ -1198,7 +1197,7 @@ func testServerStreamPingRunning(t *testing.T, local, remote *Manager, inCap int
 	remoteConn.debugMsg(debugSetClientPingDuration, 100*time.Millisecond)
 	defer remoteConn.debugMsg(debugSetClientPingDuration, clientPingInterval)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	st, err := remoteConn.NewStream(ctx, handlerTest, []byte(testPayload))
 	errFatal(err)

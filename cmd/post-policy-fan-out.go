@@ -20,10 +20,11 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"maps"
 	"sync"
 
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/s3utils"
+	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
@@ -78,10 +79,15 @@ func fanOutPutObject(ctx context.Context, bucket string, objectAPI ObjectLayer, 
 			}()
 
 			userDefined := make(map[string]string, len(req.UserMetadata))
-			for k, v := range req.UserMetadata {
-				userDefined[k] = v
+			maps.Copy(userDefined, req.UserMetadata)
+
+			tgs, err := tags.NewTags(req.UserTags, true)
+			if err != nil {
+				errs[idx] = err
+				return
 			}
-			userDefined[xhttp.AmzObjectTagging] = s3utils.TagEncode(req.UserTags)
+
+			userDefined[xhttp.AmzObjectTagging] = tgs.String()
 
 			if opts.Kind != nil {
 				encrd, objectEncryptionKey, err := newEncryptReader(ctx, hr, opts.Kind, opts.KeyID, opts.Key, bucket, req.Key, userDefined, opts.KmsCtx)

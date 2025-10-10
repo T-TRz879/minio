@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,6 +69,7 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
 `
+	//nolint:staticcheck
 	isPart := regexp.MustCompile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/part\\.[0-9]+$")
 
 	app.HideHelpCommand = true
@@ -308,7 +310,7 @@ FLAGS:
 			if ndjson {
 				return buf.Bytes(), nil
 			}
-			var msi map[string]interface{}
+			var msi map[string]any
 			dec := json.NewDecoder(buf)
 			// Use number to preserve integers.
 			dec.UseNumber()
@@ -369,8 +371,8 @@ FLAGS:
 				defer f.Close()
 				r = f
 			}
-			if strings.HasSuffix(file, ".zip") {
-				zr, err := zip.NewReader(r.(io.ReaderAt), sz)
+			if ra, ok := r.(io.ReaderAt); ok && strings.HasSuffix(file, ".zip") {
+				zr, err := zip.NewReader(ra, sz)
 				if err != nil {
 					return err
 				}
@@ -389,7 +391,7 @@ FLAGS:
 						if err != nil {
 							return err
 						}
-						var tmp map[string]interface{}
+						var tmp map[string]any
 						if err := json.Unmarshal(b2, &tmp); err == nil {
 							if b3, err := json.Marshal(tmp); err == nil {
 								b2 = b3
@@ -577,7 +579,7 @@ func (x xlMetaInlineData) json(value bool) ([]byte, error) {
 	}
 	res := []byte("{")
 
-	for i := uint32(0); i < sz; i++ {
+	for i := range sz {
 		var key, val []byte
 		key, buf, err = msgp.ReadMapKeyZC(buf)
 		if err != nil {
@@ -642,7 +644,7 @@ func (x xlMetaInlineData) files(fn func(name string, data []byte)) error {
 		return err
 	}
 
-	for i := uint32(0); i < sz; i++ {
+	for i := range sz {
 		var key, val []byte
 		key, buf, err = msgp.ReadMapKeyZC(buf)
 		if err != nil {
@@ -664,7 +666,7 @@ func (x xlMetaInlineData) files(fn func(name string, data []byte)) error {
 
 const (
 	xlHeaderVersion = 3
-	xlMetaVersion   = 2
+	xlMetaVersion   = 3
 )
 
 type xlHeaders struct {
@@ -702,7 +704,7 @@ func decodeXLHeaders(buf []byte) (x xlHeaders, b []byte, err error) {
 // Any non-nil error is returned.
 func decodeVersions(buf []byte, versions int, fn func(idx int, hdr, meta []byte) error) (err error) {
 	var tHdr, tMeta []byte // Zero copy bytes
-	for i := 0; i < versions; i++ {
+	for i := range versions {
 		tHdr, buf, err = msgp.ReadBytesZC(buf)
 		if err != nil {
 			return err
@@ -733,7 +735,7 @@ func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte, hdrVer uint) (o []byt
 	zb0001, bts, err = msgp.ReadArrayHeaderBytes(bts)
 	if err != nil {
 		err = msgp.WrapError(err)
-		return
+		return o, err
 	}
 	want := uint32(5)
 	if hdrVer > 2 {
@@ -741,29 +743,29 @@ func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte, hdrVer uint) (o []byt
 	}
 	if zb0001 != want {
 		err = msgp.ArrayError{Wanted: want, Got: zb0001}
-		return
+		return o, err
 	}
 	bts, err = msgp.ReadExactBytes(bts, (z.VersionID)[:])
 	if err != nil {
 		err = msgp.WrapError(err, "VersionID")
-		return
+		return o, err
 	}
 	z.ModTime, bts, err = msgp.ReadInt64Bytes(bts)
 	if err != nil {
 		err = msgp.WrapError(err, "ModTime")
-		return
+		return o, err
 	}
 	bts, err = msgp.ReadExactBytes(bts, (z.Signature)[:])
 	if err != nil {
 		err = msgp.WrapError(err, "Signature")
-		return
+		return o, err
 	}
 	{
 		var zb0002 uint8
 		zb0002, bts, err = msgp.ReadUint8Bytes(bts)
 		if err != nil {
 			err = msgp.WrapError(err, "Type")
-			return
+			return o, err
 		}
 		z.Type = zb0002
 	}
@@ -772,7 +774,7 @@ func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte, hdrVer uint) (o []byt
 		zb0003, bts, err = msgp.ReadUint8Bytes(bts)
 		if err != nil {
 			err = msgp.WrapError(err, "Flags")
-			return
+			return o, err
 		}
 		z.Flags = zb0003
 	}
@@ -783,7 +785,7 @@ func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte, hdrVer uint) (o []byt
 			zb0004, bts, err = msgp.ReadUint8Bytes(bts)
 			if err != nil {
 				err = msgp.WrapError(err, "EcN")
-				return
+				return o, err
 			}
 			z.EcN = zb0004
 		}
@@ -792,13 +794,13 @@ func (z *xlMetaV2VersionHeaderV2) UnmarshalMsg(bts []byte, hdrVer uint) (o []byt
 			zb0005, bts, err = msgp.ReadUint8Bytes(bts)
 			if err != nil {
 				err = msgp.WrapError(err, "EcM")
-				return
+				return o, err
 			}
 			z.EcM = zb0005
 		}
 	}
 	o = bts
-	return
+	return o, err
 }
 
 func (z xlMetaV2VersionHeaderV2) MarshalJSON() (o []byte, err error) {
@@ -984,12 +986,9 @@ func combine(files []string, out string) error {
 			}
 			ok := len(splitFilled)
 			for i, sh := range splitFilled {
-				for _, v := range sh {
-					if v == 0 {
-						split[i] = nil
-						ok--
-						break
-					}
+				if slices.Contains(sh, 0) {
+					split[i] = nil
+					ok--
 				}
 			}
 			hasParity := 0
@@ -1245,7 +1244,7 @@ func combineCrossVer(all map[string][]string, baseName string) error {
 						}
 						// Fill padding...
 						padding := len(splitFilled[0])*k - len(m.filled)
-						for i := 0; i < padding; i++ {
+						for i := range padding {
 							arr := splitFilled[k-1]
 							arr[len(arr)-i-1] = 1
 						}
@@ -1508,7 +1507,7 @@ func reconPartial(shards [][]byte, k int, parityOK []bool, splitData [][]byte, s
 			}
 		}
 	}
-	fmt.Println("Reconstructed", reconstructed, "bytes and verified", verified, "bytes of partial shard with config", shardConfig)
+	fmt.Println("Reconstructed", reconstructed, "bytes and verified", verified, "bytes of partial shard with config", string(shardConfig))
 }
 
 // bitrot returns a shard beginning at startOffset after doing bitrot checks.
@@ -1541,7 +1540,7 @@ func bitrot(val []byte, startOffset, shardSize int) ([]byte, error) {
 func shardSize(blockSize, dataBlocks int) (sz int) {
 	if dataBlocks == 0 {
 		// do nothing on invalid input
-		return
+		return sz
 	}
 	// Make denominator positive
 	if dataBlocks < 0 {
@@ -1552,9 +1551,10 @@ func shardSize(blockSize, dataBlocks int) (sz int) {
 	if blockSize > 0 && blockSize%dataBlocks != 0 {
 		sz++
 	}
-	return
+	return sz
 }
 
+//nolint:staticcheck
 var rePartNum = regexp.MustCompile("/part\\.([0-9]+)/")
 
 func getPartNum(s string) int {
